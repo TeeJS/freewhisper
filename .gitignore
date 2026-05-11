@@ -1,0 +1,17 @@
+# Build output
+*.exe
+*.exe~
+
+# Local config (endpoint URL, hotkey, etc. live here)
+config.json
+
+# Go workspace cruft
+vendor/
+*.test
+*.out
+
+# OS / editor noise
+.vscode/
+.idea/
+Thumbs.db
+*.swp
