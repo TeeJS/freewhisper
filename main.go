@@ -1,9 +1,9 @@
 // Package main is the freewhisper entry point.
 //
-// Milestone 2 scope: register a global push-to-talk hotkey (Ctrl+Shift+Space)
-// and log key-down / key-up events to a debug file. No audio capture yet —
-// this milestone proves we can reliably observe the user's hotkey activity
-// from anywhere in Windows, regardless of which window has focus.
+// Milestone 2 scope: register a global push-to-talk hotkey (Ctrl+`) and log
+// key-down / key-up events to a debug file. No audio capture yet — this
+// milestone proves we can reliably observe the user's hotkey activity from
+// anywhere in Windows, regardless of which window has focus.
 //
 // We log to a file (not stdout) because the app is built with `-H windowsgui`,
 // which suppresses the console window. Anything written to stdout/stderr in
@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/getlantern/systray"
 	"golang.design/x/hotkey"
@@ -24,9 +25,6 @@ import (
 //go:embed icon.ico
 var iconData []byte
 
-// main wires everything together: set up logging first (so any later errors
-// land in a file we can read), then hand control to systray.Run() which
-// blocks for the program's lifetime.
 func main() {
 	setupLogging()
 	log.Print("freewhisper starting")
@@ -90,35 +88,71 @@ func onExit() {
 	log.Print("freewhisper exiting")
 }
 
-// registerHotkey registers Ctrl+Shift+Space as a global hotkey and loops
-// forever logging press/release events.
+// registerHotkey registers Ctrl+` (Ctrl+backtick) as a global push-to-talk
+// hotkey and reports debounced press/release events to the log.
 //
-// Under the hood the golang.design/x/hotkey package calls Win32's
-// RegisterHotKey API, which routes hotkey messages to a hidden window the
-// library manages. RegisterHotKey requires at least one modifier — single
-// keys (like Right Alt by itself) aren't directly supported without a
-// low-level keyboard hook, which would look more like a keylogger to EDR.
+// Why backtick: it's a one-handed two-key chord (Ctrl + the key under Esc),
+// doesn't collide with Excel's Ctrl+Space (column-select), VS Code's
+// Ctrl+Space (autocomplete), or Alt+Space (window system menu).
 //
-// We initially tried Ctrl+Alt+Space but found it was already registered by
-// another process on the dev machine (likely an Office or OEM utility).
-// Ctrl+Shift+Space is less commonly grabbed and works on the same hand
-// position. The choice is hardcoded for now; we'll move it to config.json
-// in a later milestone.
+// Why a debounce window: under the hood, golang.design/x/hotkey calls Win32's
+// RegisterHotKey, which causes WM_HOTKEY messages to be re-posted at the
+// keyboard auto-repeat rate (~10ms apart on default settings) while the chord
+// is held. The library detects "release" by polling GetAsyncKeyState after
+// each WM_HOTKEY, which produces a spurious UP→DOWN pair on every repeat
+// cycle. Without debouncing, holding the chord for 2 seconds produces ~200
+// fake press cycles instead of one continuous press — disastrous for
+// push-to-talk semantics.
+//
+// The debounce: only the first DOWN of a press burst and the last UP of that
+// burst are reported. We do this by waiting `debounceWindow` after each UP
+// to see if another DOWN follows. If one does, it was auto-repeat noise; if
+// it doesn't, the release is real.
 func registerHotkey() {
-	hk := hotkey.New([]hotkey.Modifier{hotkey.ModCtrl, hotkey.ModShift}, hotkey.KeySpace)
+	// 0xC0 is Win32 VK_OEM_3 — the backtick/tilde key in the top-left corner of
+	// a US keyboard. The hotkey package's public Key constants don't include
+	// the OEM keys, but its Windows implementation passes the Key value
+	// straight through to RegisterHotKey (see hotkey_windows.go:57), so
+	// casting the raw VK is safe.
+	const vkBacktick hotkey.Key = 0xC0
+
+	// 80ms comfortably exceeds the keyboard auto-repeat interval (default
+	// Windows repeat rate is ~30/sec = 33ms; max-fast is around 30ms). If a
+	// user is genuinely tapping the chord faster than 12 times per second to
+	// trigger separate press cycles, they will be merged — acceptable trade.
+	const debounceWindow = 80 * time.Millisecond
+
+	hk := hotkey.New([]hotkey.Modifier{hotkey.ModCtrl}, vkBacktick)
 	if err := hk.Register(); err != nil {
 		log.Printf("hotkey register failed: %v", err)
 		return
 	}
-	log.Print("hotkey registered: Ctrl+Shift+Space")
+	log.Print("hotkey registered: Ctrl+`")
 
-	// Keydown() and Keyup() each return a receive-only channel of events.
-	// We block on Keydown(), log, then block on Keyup(), log, then loop.
-	// This naturally models push-to-talk: each iteration is one press cycle.
 	for {
+		// Wait for the first DOWN that starts a press cycle.
 		<-hk.Keydown()
 		log.Print("hotkey DOWN (recording would start here)")
-		<-hk.Keyup()
-		log.Print("hotkey UP (recording would stop here)")
+
+		// Drain UP/DOWN pairs caused by auto-repeat until we see an UP
+		// that *isn't* followed by another DOWN within debounceWindow.
+		// That UP is the genuine release.
+	drain:
+		for {
+			<-hk.Keyup()
+			timer := time.NewTimer(debounceWindow)
+			select {
+			case <-hk.Keydown():
+				// Auto-repeat blip — key is still held. Discard both
+				// events and keep waiting for the real release.
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+				// No DOWN within the window → release is real.
+				log.Print("hotkey UP (recording would stop here)")
+				break drain
+			}
+		}
 	}
 }
