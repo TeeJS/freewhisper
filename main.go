@@ -1,9 +1,9 @@
 // Package main is the freewhisper entry point.
 //
-// Milestone 2 scope: register a global push-to-talk hotkey (Ctrl+`) and log
-// key-down / key-up events to a debug file. No audio capture yet — this
-// milestone proves we can reliably observe the user's hotkey activity from
-// anywhere in Windows, regardless of which window has focus.
+// Milestone 3 scope: while the push-to-talk hotkey (Ctrl+`) is held,
+// capture mic audio via WASAPI and write it to test.wav on release. The
+// actual capture and WAV-writing live in recorder.go; this file just wires
+// the hotkey events to start/stop the recording.
 //
 // We log to a file (not stdout) because the app is built with `-H windowsgui`,
 // which suppresses the console window. Anything written to stdout/stderr in
@@ -130,9 +130,11 @@ func registerHotkey() {
 	log.Print("hotkey registered: Ctrl+`")
 
 	for {
-		// Wait for the first DOWN that starts a press cycle.
+		// Wait for the first DOWN that starts a press cycle, then kick off
+		// recording on a worker goroutine inside the Recorder.
 		<-hk.Keydown()
-		log.Print("hotkey DOWN (recording would start here)")
+		log.Print("hotkey DOWN — recording started")
+		rec := StartRecording()
 
 		// Drain UP/DOWN pairs caused by auto-repeat until we see an UP
 		// that *isn't* followed by another DOWN within debounceWindow.
@@ -149,10 +151,36 @@ func registerHotkey() {
 					<-timer.C
 				}
 			case <-timer.C:
-				// No DOWN within the window → release is real.
-				log.Print("hotkey UP (recording would stop here)")
+				// Genuine release: stop the recorder and persist to disk.
+				pcm, err := rec.Stop()
+				if err != nil {
+					log.Printf("recording failed: %v", err)
+					break drain
+				}
+				saveCapturedWAV(pcm)
 				break drain
 			}
 		}
 	}
+}
+
+// saveCapturedWAV writes the captured PCM bytes to test.wav in
+// %LOCALAPPDATA%\freewhisper\, alongside debug.log. We log the byte count,
+// the implied duration, and the full path so the user can find and play
+// back the file to sanity-check the capture.
+func saveCapturedWAV(pcm []byte) {
+	appData := os.Getenv("LOCALAPPDATA")
+	if appData == "" {
+		log.Printf("LOCALAPPDATA not set; can't save WAV")
+		return
+	}
+	path := filepath.Join(appData, "freewhisper", "test.wav")
+	if err := writeWAV(path, pcm, captureSampleRate, captureChannels, captureBitsPerSample); err != nil {
+		log.Printf("WAV write failed: %v", err)
+		return
+	}
+	// Duration = bytes / (sampleRate * blockAlign).
+	// blockAlign = channels * bitsPerSample/8 = 1 * 2 = 2.
+	durSec := float64(len(pcm)) / float64(captureSampleRate*uint32(captureChannels*captureBitsPerSample/8))
+	log.Printf("hotkey UP — recorded %d bytes (%.2fs) → %s", len(pcm), durSec, path)
 }
