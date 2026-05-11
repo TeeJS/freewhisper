@@ -2,7 +2,10 @@ module github.com/TeeJS/freewhisper
 
 go 1.26.3
 
-require github.com/getlantern/systray v1.2.2
+require (
+	github.com/getlantern/systray v1.2.2
+	golang.design/x/hotkey v0.4.1
+)
 
 require (
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
