@@ -47,7 +47,7 @@ freewhisper/
 ├── go.sum
 ├── main.go             ← entry point, tray icon, hotkey wiring, orchestration
 ├── recorder.go         ← WASAPI mic capture → []byte WAV
-├── transcriber.go      ← HTTP POST to whisper, JSON parsing
+├── transcriber.go      ← Wyoming-protocol TCP client (JSONL + binary PCM)
 ├── paster.go           ← clipboard write + SendInput Ctrl+V
 ├── config.go           ← config struct, load from config.json
 ├── config.example.json ← committed example config (no secrets)
@@ -68,9 +68,19 @@ All MIT/BSD. No exotic transitive dependencies expected.
 
 ## Whisper endpoint
 
-The home faster-whisper server. **TBD — exact URL, port, and API shape need to be confirmed before transcriber.go is written.** Assumption is an OpenAI-compatible `POST /v1/audio/transcriptions` endpoint accepting multipart form with a `file` field and returning `{"text": "..."}` JSON. If the actual server uses a different API, transcriber.go adapts to match.
+The home faster-whisper server speaks the **Wyoming protocol** (not OpenAI-compatible HTTP — that was an early assumption that turned out wrong). Wyoming is the same protocol used by Home Assistant's voice pipeline and Rhasspy — JSONL header lines plus binary audio payloads over plain TCP.
 
-User will fill `config.json` with the endpoint URL after first build.
+Default endpoint: `192.168.1.25:10300` (standard Wyoming whisper port). Server reports `faster-whisper 3.1.0` with the `medium` model.
+
+`transcriber.go` implements a minimal Wyoming client from scratch — no external library needed. The dance is:
+
+1. `transcribe` event (language hint)
+2. `audio-start` (sample rate, width, channels)
+3. `audio-chunk` × N (binary PCM payload, ~50 ms each)
+4. `audio-stop`
+5. read `transcript` event from server
+
+The server resamples our 48 kHz capture to 16 kHz internally, so no client-side resampling is needed. Endpoint host/port and language live in `config.json`.
 
 ## User context
 

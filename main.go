@@ -1,9 +1,10 @@
 // Package main is the freewhisper entry point.
 //
-// Milestone 4 scope: while Ctrl+` is held, capture mic audio (recorder.go);
-// on release, send the PCM to the Wyoming whisper server (transcriber.go)
-// and log the transcription. The captured audio is still also written to
-// test.wav for sanity-checking.
+// Milestone 5 (MVP-complete) scope: while Ctrl+` is held, capture mic audio
+// (recorder.go); on release, send the PCM to the Wyoming whisper server
+// (transcriber.go), then paste the resulting text into the active window
+// (paster.go). The captured audio is still also written to test.wav for
+// sanity-checking on next-time-at-keyboard debug sessions.
 //
 // Endpoint and language come from config.json (loaded at startup, falls
 // back to compiled defaults if missing).
@@ -171,7 +172,7 @@ func registerHotkey() {
 					break drain
 				}
 				saveCapturedWAV(pcm)
-				transcribeAndLog(pcm)
+				transcribeAndPaste(pcm)
 				break drain
 			}
 		}
@@ -199,16 +200,16 @@ func saveCapturedWAV(pcm []byte) {
 	log.Printf("hotkey UP — recorded %d bytes (%.2fs) → %s", len(pcm), durSec, path)
 }
 
-// transcribeAndLog ships the captured PCM to the configured whisper endpoint
-// and logs the recognized text (or an error). We measure wall-clock latency
-// here so we can see how fast/slow the round-trip really is — useful when
-// tuning later, and a good reality-check that the server is healthy.
+// transcribeAndPaste ships the captured PCM to the configured whisper
+// endpoint, logs the recognized text, and pastes it into the focused
+// window. We measure wall-clock latency on transcription (the slow step)
+// so regressions are visible at a glance in the log.
 //
 // The whole thing runs on the hotkey goroutine (synchronously). That's
 // fine for a push-to-talk app — the user is already waiting after release
 // to see the text appear. Going async would only add complexity without
 // improving the perceived experience.
-func transcribeAndLog(pcm []byte) {
+func transcribeAndPaste(pcm []byte) {
 	start := time.Now()
 	text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, pcm)
 	elapsed := time.Since(start)
@@ -217,4 +218,17 @@ func transcribeAndLog(pcm []byte) {
 		return
 	}
 	log.Printf("transcript (%.2fs): %q", elapsed.Seconds(), text)
+
+	// Whisper sometimes returns text with a leading space (its tokenizer
+	// quirk). It looks ugly when pasted into the middle of an existing
+	// sentence, so trim it. Trailing whitespace is fine to leave.
+	if len(text) > 0 && text[0] == ' ' {
+		text = text[1:]
+	}
+	if text == "" {
+		return // nothing to paste
+	}
+	if err := Paste(text); err != nil {
+		log.Printf("paste failed: %v", err)
+	}
 }
