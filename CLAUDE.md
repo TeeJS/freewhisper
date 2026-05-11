@@ -45,10 +45,11 @@ freewhisper/
 ├── README.md           ← user-facing setup/usage docs
 ├── go.mod
 ├── go.sum
-├── main.go             ← entry point, tray icon, hotkey wiring, orchestration
-├── recorder.go         ← WASAPI mic capture → []byte WAV
+├── main.go             ← entry point, tray icon, hotkey wiring, streaming consumer, ordered paster
+├── recorder.go         ← WASAPI mic capture, VAD-bounded ChunkedRecorder, pre-roll ring, WAV writer
+├── vad.go              ← energy-based Voice Activity Detector (with ambient-noise calibration)
 ├── transcriber.go      ← Wyoming-protocol TCP client (JSONL + binary PCM)
-├── paster.go           ← clipboard write + SendInput Ctrl+V
+├── paster.go           ← clipboard write + Ctrl-state-aware SendInput Ctrl+V
 ├── indicators.go       ← tray-icon color swap + Beep() during recording
 ├── settings.go         ← walk-based settings dialog (right-click → Settings…)
 ├── hotkeymap.go        ← string ↔ hotkey.Modifier/Key lookups (shared by config + GUI)

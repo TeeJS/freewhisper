@@ -55,6 +55,7 @@ var (
 	procSetClipboardData       = user32.NewProc("SetClipboardData")
 	procIsClipboardFmtAvail    = user32.NewProc("IsClipboardFormatAvailable")
 	procSendInput              = user32.NewProc("SendInput")
+	procGetAsyncKeyState       = user32.NewProc("GetAsyncKeyState")
 
 	procGlobalAlloc  = kernel32.NewProc("GlobalAlloc")
 	procGlobalLock   = kernel32.NewProc("GlobalLock")
@@ -256,21 +257,59 @@ func closeClipboard() {
 	procCloseClipboard.Call()
 }
 
-// sendCtrlV synthesizes a Ctrl-down, V-down, V-up, Ctrl-up sequence via
-// SendInput. SendInput accepts an array of INPUT structs and processes
-// them in order, with the right inter-event timing for Windows to treat
-// them as a real key chord.
+// sendCtrlV synthesizes whatever subset of (Ctrl-down, V-down, V-up,
+// Ctrl-up) is needed for the focused window to receive a paste, based
+// on whether Ctrl is currently held by the user.
+//
+// Why the conditional: in streaming mode, this gets called WHILE the
+// user is holding the push-to-talk chord (e.g., Ctrl+`). If we naively
+// inject Ctrl-down…Ctrl-up, the Ctrl-up tells Windows the user has
+// released Ctrl, which un-registers the global hotkey state momentarily.
+// During that gap, every WM_KEYDOWN for `` falls through to the focused
+// window as a literal backtick character — corrupting the user's
+// dictation output with strings of backticks.
+//
+// Fix: check the *actual* hardware state via GetAsyncKeyState. If Ctrl
+// is already pressed, inject only V-down/V-up — the user's hand-held
+// Ctrl provides the modifier, and we never disturb the hotkey
+// registration. If Ctrl is NOT held (e.g., a deferred paste after the
+// user released the hotkey), inject the full four-event sequence.
 //
 // SendInput's signature:
-//   UINT SendInput(UINT cInputs, LPINPUT pInputs, int cbSize);
+//
+//	UINT SendInput(UINT cInputs, LPINPUT pInputs, int cbSize);
+//
 // cbSize is the per-event size; we pass sizeof(keyboardInput) which must
 // equal sizeof(INPUT) on x64 (40 bytes).
 func sendCtrlV() error {
-	inputs := [4]keyboardInput{
+	if isCtrlDown() {
+		return sendInputs([]keyboardInput{
+			{Type: inputKeyboard, Vk: vkV},
+			{Type: inputKeyboard, Vk: vkV, Flags: keyeventfKeyup},
+		})
+	}
+	return sendInputs([]keyboardInput{
 		{Type: inputKeyboard, Vk: vkControl},
 		{Type: inputKeyboard, Vk: vkV},
 		{Type: inputKeyboard, Vk: vkV, Flags: keyeventfKeyup},
 		{Type: inputKeyboard, Vk: vkControl, Flags: keyeventfKeyup},
+	})
+}
+
+// isCtrlDown reports whether either physical Ctrl key is currently
+// pressed, according to Win32's GetAsyncKeyState. The high-order bit of
+// the SHORT return is set when the key is down, so we test against
+// 0x8000. We check VK_CONTROL which covers both left and right Ctrl.
+func isCtrlDown() bool {
+	r, _, _ := procGetAsyncKeyState.Call(uintptr(vkControl))
+	return uint16(r)&0x8000 != 0
+}
+
+// sendInputs is the bare-bones wrapper around user32!SendInput. Splitting
+// it out keeps sendCtrlV's two branches readable.
+func sendInputs(inputs []keyboardInput) error {
+	if len(inputs) == 0 {
+		return nil
 	}
 	cbSize := unsafe.Sizeof(inputs[0])
 	r, _, callErr := procSendInput.Call(
@@ -279,9 +318,6 @@ func sendCtrlV() error {
 		cbSize,
 	)
 	if r != uintptr(len(inputs)) {
-		// SendInput returns the count of events that were successfully
-		// injected; anything less than what we passed means the input
-		// stream was blocked (e.g., by UAC for elevated targets).
 		return fmt.Errorf("SendInput injected %d of %d events: %v", r, len(inputs), callErr)
 	}
 	return nil

@@ -56,6 +56,14 @@ type Config struct {
 	// NotifyBeep plays a short audio chime on record start and stop.
 	// Default false to stay quiet.
 	NotifyBeep bool `json:"notify_beep"`
+
+	// SilenceDurationMs is how long the user must pause speaking before
+	// the recorder cuts the current chunk and ships it to whisper for
+	// transcription. Shorter = more responsive but more chunks (and
+	// whisper is less accurate on short fragments). Longer = closer to
+	// the old batch behavior. Default 400ms is a reasonable compromise.
+	// Range: anything > 100ms is sensible; we don't enforce.
+	SilenceDurationMs int `json:"silence_duration_ms"`
 }
 
 // configFilename is the name we look for next to the .exe and create on
@@ -75,6 +83,7 @@ func DefaultConfig() Config {
 		HotkeyKey:         "Backtick",
 		NotifyColorChange: false,
 		NotifyBeep:        false,
+		SilenceDurationMs: 400,
 	}
 }
 
@@ -136,6 +145,11 @@ func LoadConfig() (Config, string, bool) {
 	// that's the same as the safe default, so this is fine.
 	cfg.NotifyColorChange = fromFile.NotifyColorChange
 	cfg.NotifyBeep = fromFile.NotifyBeep
+
+	// SilenceDurationMs == 0 is "absent or invalid" — keep the default.
+	if fromFile.SilenceDurationMs > 0 {
+		cfg.SilenceDurationMs = fromFile.SilenceDurationMs
+	}
 
 	return cfg, path, true
 }

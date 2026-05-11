@@ -1,7 +1,12 @@
-// recorder.go: WASAPI microphone capture and WAV file writing.
+// recorder.go: WASAPI microphone capture with VAD-driven chunking.
 //
-// This file is dense with Windows-specific concepts. Quick glossary you'll
-// see used below:
+// As of Phase 3 the recorder no longer waits for hotkey release before
+// surfacing audio. It splits the audio into utterance-sized chunks at
+// natural pause boundaries (detected by vad.go) and emits each chunk as
+// it happens, so a downstream pipeline can transcribe and paste partial
+// results while the user is still speaking.
+//
+// This file is dense with Windows-specific concepts. Quick glossary:
 //
 //   COM           - Component Object Model. Windows' object-IPC system. Every
 //                   Win32 audio call goes through it. Each thread that wants
@@ -9,26 +14,21 @@
 //                   CoInitializeEx; that's what runtime.LockOSThread is for.
 //
 //   WASAPI        - Windows Audio Session API. The modern (Vista+) audio API.
-//                   Faster, lower-latency, and less buggy than its predecessors
-//                   (MME, DirectSound, WaveOut).
 //
-//   IMMDevice     - "MultiMedia Device". Represents a physical audio device
-//                   (a mic, speakers, headphones). We get one by asking
+//   IMMDevice     - Represents a physical audio device. We get one by asking
 //                   IMMDeviceEnumerator for the default eCapture device.
 //
-//   IAudioClient  - The stream object. We Initialize() it with a format we
-//                   want, Start() it to begin capture, and Stop() it to end.
+//   IAudioClient  - The stream object. Initialize() with a format we want,
+//                   Start() to begin capture, Stop() to end.
 //
-//   IAudioCaptureClient - The buffer pump. After we Start the audio client,
-//                   we ask this object "any new packets?", and it hands us
-//                   pointers to chunks of recorded PCM data. We copy what we
-//                   want, then ReleaseBuffer to tell Windows we're done.
+//   IAudioCaptureClient - The buffer pump. We poll GetNextPacketSize and
+//                   GetBuffer to pull out chunks of recorded PCM.
 //
-// Strategy: we ask WASAPI to deliver audio in our preferred format
-// (48 kHz mono 16-bit PCM, which is small, well-supported, and close enough
-// to whisper's preferred 16 kHz that the server-side resample is cheap), and
-// use the AUTOCONVERTPCM flag so Windows handles any mismatch with the
-// device's native format internally.
+// Strategy: ask WASAPI to deliver 48 kHz mono 16-bit PCM. With
+// AUTOCONVERTPCM, the audio engine resamples from the device's native
+// format. We slice each WASAPI packet into 20 ms VAD frames, feed each
+// frame to the detector, and watch for "speech then sustained silence"
+// transitions — that's a chunk boundary.
 
 package main
 
@@ -57,79 +57,102 @@ const (
 )
 
 // AUDCLNT_BUFFERFLAGS_SILENT (defined by WASAPI; not exposed by go-wca).
-// When this flag is set on a captured packet, the data pointer may be
-// invalid garbage — we must write silence (zeros) instead of reading it.
-// See https://learn.microsoft.com/en-us/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags
 const audClntBufferFlagsSilent uint32 = 0x2
 
-// Recorder is a single push-to-talk capture session. Create one via
-// StartRecording(), let it run on its own goroutine, then call Stop() to
-// retrieve the captured audio.
-type Recorder struct {
-	stopCh   chan struct{}     // closed by Stop() to signal the worker to wrap up
-	resultCh chan recordResult // worker pushes the final result here exactly once
+// Chunk is one VAD-bounded segment of audio to be transcribed. The Seq
+// field lets the downstream paste queue restore order if transcribe
+// finishes out of order (chunk 2 might come back from whisper faster than
+// chunk 1 if the server is doing parallel processing).
+type Chunk struct {
+	Seq int    // 0-indexed within this recording session
+	PCM []byte // 48 kHz mono 16-bit LE PCM bytes for this chunk
 }
 
-type recordResult struct {
-	pcm []byte // raw PCM bytes in the format defined by capture* constants above
-	err error
+// ChunkedRecorder runs a single push-to-talk recording session that emits
+// VAD-bounded chunks as the user pauses speaking. Create with
+// StartChunkedRecording, consume r.Chunks(), then call r.Stop() when the
+// hotkey is released — it sends a final chunk (if any audio remains) and
+// closes the chunks channel.
+type ChunkedRecorder struct {
+	silenceFrames int // number of consecutive silence frames that = a boundary
+
+	chunks chan Chunk    // VAD-detected chunk boundaries land here
+	stopCh chan struct{} // closed by Stop() to signal the worker
+	doneCh chan struct{} // closed by run() after final chunk + cleanup
+
+	// fullPCM and err are set by run() before closing doneCh and read
+	// only by Stop() after waiting on doneCh — no concurrent access.
+	fullPCM []byte
+	err     error
 }
 
-// StartRecording begins capturing from the default audio capture device on a
-// dedicated goroutine and returns a handle the caller can use to stop and
-// retrieve the recording. The returned Recorder is already running by the
-// time this function returns.
-func StartRecording() *Recorder {
-	r := &Recorder{
-		stopCh:   make(chan struct{}),
-		resultCh: make(chan recordResult, 1),
+// StartChunkedRecording begins capturing and returns a recorder. The
+// returned recorder is already running by the time this function returns;
+// the caller should consume r.Chunks() in a goroutine, then call r.Stop()
+// when ready.
+//
+// silenceDurationMs controls how long a pause must last (in milliseconds)
+// before the recorder cuts a chunk boundary. Comes from config.
+func StartChunkedRecording(silenceDurationMs int) *ChunkedRecorder {
+	silenceFrames := silenceDurationMs / vadFrameMs
+	if silenceFrames < 1 {
+		silenceFrames = 1
+	}
+	r := &ChunkedRecorder{
+		silenceFrames: silenceFrames,
+		// 16-deep buffer = plenty for typical speech (each chunk is
+		// hundreds of ms, downstream paster drains quickly).
+		chunks: make(chan Chunk, 16),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
 	}
 	go r.run()
 	return r
 }
 
-// Stop signals the recorder to finish, then blocks until it returns the
-// captured PCM bytes (or an error). It is safe to call Stop exactly once
-// per Recorder; calling it twice will deadlock.
-func (r *Recorder) Stop() ([]byte, error) {
-	close(r.stopCh)
-	res := <-r.resultCh
-	return res.pcm, res.err
+// Chunks returns the channel on which boundary-detected chunks arrive.
+// The channel is closed after Stop() returns (well, after the worker
+// finishes final cleanup).
+func (r *ChunkedRecorder) Chunks() <-chan Chunk {
+	return r.chunks
 }
 
-// run is the worker goroutine entry point. It locks itself to a single OS
-// thread for the duration of the capture so all COM calls stay within the
-// same apartment — COM is strict about this; cross-thread calls without
-// marshalling will silently corrupt state.
-func (r *Recorder) run() {
+// Stop signals the recorder to wrap up and blocks until the worker has
+// emitted any final pending audio as the last chunk and closed the
+// chunks channel. Returns the full concatenated PCM (useful for writing
+// test.wav for debug) and the first capture error encountered (nil on
+// clean shutdown).
+func (r *ChunkedRecorder) Stop() ([]byte, error) {
+	close(r.stopCh)
+	<-r.doneCh
+	return r.fullPCM, r.err
+}
+
+// run is the worker goroutine entry point. We LockOSThread so all COM
+// calls stay within the same apartment. We close r.chunks and r.doneCh
+// on exit so consumers can detect the end.
+func (r *ChunkedRecorder) run() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	defer close(r.doneCh)
+	defer close(r.chunks)
 
-	pcm, err := captureLoop(r.stopCh)
-	r.resultCh <- recordResult{pcm: pcm, err: err}
+	r.fullPCM, r.err = r.captureLoop()
 }
 
-// captureLoop is the meat of the recorder: initialize COM, walk the WASAPI
-// object graph (enumerator → device → audio client → capture client), spin
-// in a poll loop appending packets to a buffer, and tear everything down
-// cleanly when stopCh closes.
-//
-// Returns the accumulated PCM bytes (which may be partial if an error
-// occurred mid-capture) and the first error encountered (nil on success).
-func captureLoop(stopCh <-chan struct{}) ([]byte, error) {
-	// 1. Enter a COM apartment. APARTMENTTHREADED is the right choice for a
-	//    GUI-ish app and is what most WASAPI examples use. If COM was already
-	//    initialized on this thread (it shouldn't be, but just in case), we
-	//    get back an S_FALSE-style error, which we treat as non-fatal.
+// captureLoop initializes WASAPI, then spins in a poll loop slicing each
+// audio packet into 20 ms VAD frames and emitting chunks at boundaries.
+// Returns the full concatenated PCM and any error.
+func (r *ChunkedRecorder) captureLoop() ([]byte, error) {
+	// 1. Enter a COM apartment.
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
-		if oerr, ok := err.(*ole.OleError); !ok || oerr.Code() != 1 /* S_FALSE */ {
+		if oerr, ok := err.(*ole.OleError); !ok || oerr.Code() != 1 {
 			return nil, fmt.Errorf("CoInitializeEx: %w", err)
 		}
 	}
 	defer ole.CoUninitialize()
 
-	// 2. Create the device enumerator. This is the entry point into the
-	//    MMDevice API — from it we can query for the default mic.
+	// 2. Device enumerator.
 	var deviceEnumerator *wca.IMMDeviceEnumerator
 	if err := wca.CoCreateInstance(
 		wca.CLSID_MMDeviceEnumerator,
@@ -142,32 +165,21 @@ func captureLoop(stopCh <-chan struct{}) ([]byte, error) {
 	}
 	defer deviceEnumerator.Release()
 
-	// 3. Get the default capture device. The two integer arguments are:
-	//      eDataFlow = 1 (eCapture)   — microphones and other inputs
-	//      eRole     = 0 (eConsole)   — the device Windows uses for general I/O
-	//    These are MMDevice API enum values; go-wca doesn't expose them as
-	//    named constants, so we pass the raw integers with a comment.
+	// 3. Default capture (eCapture=1) device for console (eConsole=0) role.
 	var device *wca.IMMDevice
-	if err := deviceEnumerator.GetDefaultAudioEndpoint(1 /*eCapture*/, 0 /*eConsole*/, &device); err != nil {
+	if err := deviceEnumerator.GetDefaultAudioEndpoint(1, 0, &device); err != nil {
 		return nil, fmt.Errorf("GetDefaultAudioEndpoint(eCapture, eConsole): %w", err)
 	}
 	defer device.Release()
 
-	// 4. Activate IAudioClient on the device. "Activate" is COM-speak for
-	//    "give me an interface pointer to this object so I can call methods
-	//    on it." It does not start the audio stream — that's Step 7.
+	// 4. Activate IAudioClient.
 	var audioClient *wca.IAudioClient
 	if err := device.Activate(wca.IID_IAudioClient, wca.CLSCTX_ALL, nil, &audioClient); err != nil {
 		return nil, fmt.Errorf("device.Activate(IAudioClient): %w", err)
 	}
 	defer audioClient.Release()
 
-	// 5. Build the format we want WASAPI to deliver: 48 kHz mono 16-bit PCM.
-	//    NBlockAlign = bytes per "frame" (one sample across all channels)
-	//                = NChannels * WBitsPerSample / 8
-	//    NAvgBytesPerSec = NSamplesPerSec * NBlockAlign
-	//    These are derived but must be filled in manually — WASAPI uses them
-	//    for buffer sizing internally.
+	// 5. Requested format: 48 kHz mono 16-bit PCM.
 	blockAlign := captureChannels * captureBitsPerSample / 8
 	wfx := &wca.WAVEFORMATEX{
 		WFormatTag:      wca.WAVE_FORMAT_PCM,
@@ -176,21 +188,9 @@ func captureLoop(stopCh <-chan struct{}) ([]byte, error) {
 		NAvgBytesPerSec: captureSampleRate * uint32(blockAlign),
 		NBlockAlign:     blockAlign,
 		WBitsPerSample:  captureBitsPerSample,
-		// CbSize = 0 for plain PCM (no extra format-specific data follows)
 	}
 
-	// 6. Initialize the audio stream in shared mode with format conversion
-	//    enabled. The two flags together tell the audio engine:
-	//      AUTOCONVERTPCM        — "if my requested format doesn't match the
-	//                              device's native format, insert a converter
-	//                              for me instead of failing"
-	//      SRC_DEFAULT_QUALITY   — "use the medium-quality resampler for that
-	//                              conversion" (vs. fast/low-quality)
-	//    Buffer duration: 1 second (10,000,000 100-ns units). That's our
-	//    safety margin — if our poll loop falls behind by up to 1 second,
-	//    no data is lost.
-	//
-	//    nsPeriodicity must be 0 in shared mode (Windows manages timing).
+	// 6. Initialize with AUTOCONVERTPCM + SRC_DEFAULT_QUALITY.
 	flags := uint32(wca.AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | wca.AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY)
 	const bufferDuration100ns = wca.REFERENCE_TIME(10_000_000) // 1 second
 	if err := audioClient.Initialize(
@@ -204,38 +204,110 @@ func captureLoop(stopCh <-chan struct{}) ([]byte, error) {
 		return nil, fmt.Errorf("audioClient.Initialize: %w", err)
 	}
 
-	// 7. Grab the IAudioCaptureClient companion interface that we'll poll
-	//    to pull packets out of WASAPI's ring buffer.
+	// 7. IAudioCaptureClient.
 	var captureClient *wca.IAudioCaptureClient
 	if err := audioClient.GetService(wca.IID_IAudioCaptureClient, &captureClient); err != nil {
-		return nil, fmt.Errorf("audioClient.GetService(IAudioCaptureClient): %w", err)
+		return nil, fmt.Errorf("audioClient.GetService: %w", err)
 	}
 	defer captureClient.Release()
 
-	// 8. Figure out how often to poll. Default device period is the audio
-	//    engine's natural cadence (~10 ms typically). We poll twice per
-	//    period — fast enough to never miss data, slow enough to not burn
-	//    CPU spinning.
+	// 8. Polling cadence.
 	var defaultPeriod, minPeriod wca.REFERENCE_TIME
 	_ = audioClient.GetDevicePeriod(&defaultPeriod, &minPeriod)
-	pollInterval := time.Duration(defaultPeriod) * 100 // 100-ns units → nanoseconds
+	pollInterval := time.Duration(defaultPeriod) * 100
 	if pollInterval <= 0 || pollInterval > 50*time.Millisecond {
-		pollInterval = 10 * time.Millisecond // sane fallback
+		pollInterval = 10 * time.Millisecond
 	}
 	pollInterval /= 2
 
-	// 9. Start the stream. From this point until audioClient.Stop(), Windows
-	//    is actively writing mic samples into our buffer.
+	// 9. Go.
 	if err := audioClient.Start(); err != nil {
 		return nil, fmt.Errorf("audioClient.Start: %w", err)
 	}
 	defer audioClient.Stop()
 
-	// 10. Poll loop. Each iteration drains all available packets. We exit
-	//     when stopCh closes (caller hit hotkey up) or a drain error occurs.
-	var buf bytes.Buffer
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
+	// 10. Chunking state machine.
+	//
+	// pending     - raw WASAPI bytes not yet diced into 20 ms frames
+	// chunkBuf    - current chunk-in-progress, shipped at next silence
+	// fullBuf     - everything (for test.wav)
+	// preRoll     - small ring buffer of the most recent N frames of
+	//               pre-speech audio. When VAD first detects speech in
+	//               a chunk, we prepend the ring's contents to chunkBuf
+	//               so we don't miss the first phoneme or two — by the
+	//               time the energy detector decides "yes that's
+	//               speech," the user has usually already vocalized
+	//               20–80 ms of audio we'd otherwise drop on the floor.
+	//
+	// inSpeech         - have we observed at least one speech frame in
+	//                    this chunk? Used to gate silence-counting and
+	//                    pre-roll prepending.
+	// silenceFramesSeen - consecutive silence frames since last speech.
+	//                    Boundary fires when this reaches r.silenceFrames.
+	var pending bytes.Buffer
+	var chunkBuf bytes.Buffer
+	var fullBuf bytes.Buffer
+	vad := NewVAD()
+	frameBytes := FrameBytes()
+	// 12 frames × 20 ms = 240 ms of pre-roll. Enough to cover the VAD
+	// calibration window (200 ms) plus typical detector latency without
+	// inflating chunks meaningfully.
+	const preRollFrames = 12
+	preRoll := newFrameRing(preRollFrames, frameBytes)
+	var inSpeech bool
+	var silenceFramesSeen int
+	seq := 0
+
+	emit := func() {
+		if chunkBuf.Len() == 0 {
+			return
+		}
+		// Copy the bytes so the next chunkBuf reset doesn't clobber what
+		// the consumer is reading. bytes.Buffer.Bytes() returns a slice
+		// backed by the buffer's internal storage; we own that until
+		// chunkBuf is mutated again.
+		out := make([]byte, chunkBuf.Len())
+		copy(out, chunkBuf.Bytes())
+		r.chunks <- Chunk{Seq: seq, PCM: out}
+		seq++
+		chunkBuf.Reset()
+		inSpeech = false
+		silenceFramesSeen = 0
+	}
+
+	processFrame := func(frame []byte) {
+		// Always append to full buffer for test.wav.
+		fullBuf.Write(frame)
+
+		isSpeech := vad.IsSpeech(frame)
+
+		if isSpeech {
+			if !inSpeech {
+				// First speech frame after silence — prepend the
+				// pre-roll ring buffer so we don't miss the leading
+				// edge of the utterance (VAD calibration + detector
+				// latency eats the first ~200 ms otherwise).
+				preRoll.appendTo(&chunkBuf)
+			}
+			inSpeech = true
+			silenceFramesSeen = 0
+			chunkBuf.Write(frame)
+			return
+		}
+		if inSpeech {
+			// Trailing silence after speech: append to current chunk and
+			// see if we've accumulated enough silence to cut.
+			chunkBuf.Write(frame)
+			silenceFramesSeen++
+			if silenceFramesSeen >= r.silenceFrames {
+				emit()
+			}
+			return
+		}
+		// Pre-speech silence between chunks: stash in the pre-roll ring
+		// so we can prepend it when speech finally arrives.
+		preRoll.push(frame)
+	}
 
 	drain := func() error {
 		for {
@@ -244,73 +316,75 @@ func captureLoop(stopCh <-chan struct{}) ([]byte, error) {
 				return fmt.Errorf("GetNextPacketSize: %w", err)
 			}
 			if packetFrames == 0 {
-				return nil // no more packets ready right now
+				break
 			}
-
 			var dataPtr *byte
 			var framesRead, packetFlags uint32
 			if err := captureClient.GetBuffer(&dataPtr, &framesRead, &packetFlags, nil, nil); err != nil {
 				return fmt.Errorf("GetBuffer: %w", err)
 			}
-
 			if framesRead > 0 {
 				sizeBytes := int(framesRead) * int(wfx.NBlockAlign)
 				if packetFlags&audClntBufferFlagsSilent != 0 {
-					// Silent packet: data pointer may be junk. Emit zeros.
-					buf.Write(make([]byte, sizeBytes))
+					pending.Write(make([]byte, sizeBytes))
 				} else {
-					// unsafe.Slice wraps WASAPI's buffer in a Go slice so we
-					// can read it. buf.Write copies the bytes into our own
-					// storage, so we're safe to ReleaseBuffer afterward.
-					buf.Write(unsafe.Slice(dataPtr, sizeBytes))
+					pending.Write(unsafe.Slice(dataPtr, sizeBytes))
 				}
 			}
-
 			if err := captureClient.ReleaseBuffer(framesRead); err != nil {
 				return fmt.Errorf("ReleaseBuffer: %w", err)
 			}
 		}
+		// Slice 20 ms frames out of pending and feed VAD.
+		for pending.Len() >= frameBytes {
+			frame := make([]byte, frameBytes)
+			_, _ = pending.Read(frame)
+			processFrame(frame)
+		}
+		return nil
 	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-stopCh:
-			// One final drain in case packets arrived after the last tick.
+		case <-r.stopCh:
+			// Final drain so we don't lose audio captured between the
+			// last tick and the stop signal.
 			if err := drain(); err != nil {
-				return buf.Bytes(), err
+				return fullBuf.Bytes(), err
 			}
-			return buf.Bytes(), nil
+			// Anything still in chunkBuf is the user's final phrase —
+			// emit it as the last chunk regardless of whether silence
+			// was detected (they released the hotkey, that's the
+			// definitive boundary).
+			if chunkBuf.Len() > 0 {
+				out := make([]byte, chunkBuf.Len())
+				copy(out, chunkBuf.Bytes())
+				r.chunks <- Chunk{Seq: seq, PCM: out}
+			}
+			return fullBuf.Bytes(), nil
+
 		case <-ticker.C:
 			if err := drain(); err != nil {
-				return buf.Bytes(), err
+				return fullBuf.Bytes(), err
 			}
 		}
 	}
 }
 
-// writeWAV serializes raw PCM bytes to a standard WAV file at `path`. The
-// format constants (sample rate, channels, bits) must match the data — we
-// don't inspect the bytes, we just describe them in the header.
+// writeWAV serializes raw PCM bytes to a standard WAV file at `path`.
+// Format args must match the data; we don't inspect the bytes, only
+// describe them in the header.
 //
-// WAV / RIFF file layout (all little-endian, no padding):
+// WAV / RIFF file layout (little-endian, no padding):
 //
-//	"RIFF" (4 bytes)
-//	file size minus 8 (uint32)
-//	"WAVE" (4 bytes)
-//	"fmt " (4 bytes, note trailing space)
-//	fmt chunk size = 16 for PCM (uint32)
-//	format tag = 1 for PCM (uint16)
-//	channels (uint16)
-//	sample rate (uint32)
-//	byte rate = sampleRate * channels * bitsPerSample/8 (uint32)
-//	block align = channels * bitsPerSample/8 (uint16)
-//	bits per sample (uint16)
-//	"data" (4 bytes)
-//	data size in bytes (uint32)
-//	... PCM samples ...
-//
-// This is the simplest variant — no LIST/INFO chunks, no extended fmt,
-// no padding. Every audio player on the planet will read it.
+//	"RIFF" (4) + (file size - 8) (uint32) + "WAVE" (4)
+//	"fmt " (4) + 16 (uint32) + format tag (uint16) + channels (uint16) +
+//	   sample rate (uint32) + byte rate (uint32) + block align (uint16) +
+//	   bits per sample (uint16)
+//	"data" (4) + data size (uint32) + PCM samples
 func writeWAV(path string, pcm []byte, sampleRate uint32, channels uint16, bitsPerSample uint16) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -321,16 +395,8 @@ func writeWAV(path string, pcm []byte, sampleRate uint32, channels uint16, bitsP
 	byteRate := sampleRate * uint32(channels) * uint32(bitsPerSample) / 8
 	blockAlign := channels * bitsPerSample / 8
 	dataSize := uint32(len(pcm))
-
-	// "file size minus 8" = (everything after the first 8 bytes).
-	// Everything before "data" header is 12 + 8 + 16 = 36 bytes, plus the
-	// 8-byte "data" + size header which is included in this count.
-	// So: 36 (header) + dataSize. The leading "RIFF" + size = 8 bytes
-	// are excluded by definition.
 	chunkSize := 36 + dataSize
 
-	// Use a single buffered writer? Honestly the header is only ~44 bytes
-	// then a single Write of the body, so plain os.File is fine.
 	if err := writeHeader(f, chunkSize, sampleRate, channels, bitsPerSample, byteRate, blockAlign, dataSize); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
@@ -340,7 +406,56 @@ func writeWAV(path string, pcm []byte, sampleRate uint32, channels uint16, bitsP
 	return nil
 }
 
-// writeHeader factored out only to keep writeWAV's body readable.
+// frameRing is a tiny fixed-capacity ring buffer of 20 ms PCM frames,
+// used by the chunked recorder to keep recent pre-speech audio on hand.
+// When VAD finally fires, we prepend the ring's contents to the current
+// chunk so the first phoneme of the utterance survives the VAD's
+// calibration + detection latency.
+//
+// All operations are O(1). The internal frames slice has fixed length =
+// capacity; push wraps around via modular indexing on next.
+type frameRing struct {
+	frames   [][]byte // each entry is a frameBytes-sized slice
+	capacity int      // max number of frames retained
+	next     int      // index of the next slot to write
+	filled   int      // number of slots currently populated (≤ capacity)
+}
+
+func newFrameRing(capacity, frameBytes int) *frameRing {
+	return &frameRing{
+		frames:   make([][]byte, capacity),
+		capacity: capacity,
+	}
+}
+
+// push copies frame into the ring. The frame slice is copied so the
+// caller is free to reuse the underlying buffer.
+func (r *frameRing) push(frame []byte) {
+	cp := make([]byte, len(frame))
+	copy(cp, frame)
+	r.frames[r.next] = cp
+	r.next = (r.next + 1) % r.capacity
+	if r.filled < r.capacity {
+		r.filled++
+	}
+}
+
+// appendTo writes the ring's stored frames into dst in chronological
+// order (oldest first), then clears the ring. We clear so each chunk's
+// pre-roll comes only from audio that was actually pre-speech for THIS
+// chunk — not stale frames from a previous utterance.
+func (r *frameRing) appendTo(dst *bytes.Buffer) {
+	// Oldest frame is at position (next - filled), modulo capacity.
+	start := (r.next - r.filled + r.capacity) % r.capacity
+	for i := 0; i < r.filled; i++ {
+		idx := (start + i) % r.capacity
+		dst.Write(r.frames[idx])
+		r.frames[idx] = nil
+	}
+	r.next = 0
+	r.filled = 0
+}
+
 func writeHeader(w io.Writer, chunkSize, sampleRate uint32, channels, bitsPerSample uint16, byteRate uint32, blockAlign uint16, dataSize uint32) error {
 	le := binary.LittleEndian
 	if _, err := io.WriteString(w, "RIFF"); err != nil {
@@ -358,7 +473,7 @@ func writeHeader(w io.Writer, chunkSize, sampleRate uint32, channels, bitsPerSam
 	if err := binary.Write(w, le, uint32(16)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, le, uint16(1)); err != nil { // WAVE_FORMAT_PCM
+	if err := binary.Write(w, le, uint16(1)); err != nil {
 		return err
 	}
 	if err := binary.Write(w, le, channels); err != nil {

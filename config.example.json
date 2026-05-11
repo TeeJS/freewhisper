@@ -5,5 +5,6 @@
   "hotkey_modifiers": ["Ctrl"],
   "hotkey_key": "Backtick",
   "notify_color_change": false,
-  "notify_beep": false
+  "notify_beep": false,
+  "silence_duration_ms": 400
 }

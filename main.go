@@ -20,6 +20,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -62,10 +64,11 @@ func main() {
 			log.Printf("config: wrote default config to %s (first run)", cfgPath)
 		}
 	}
-	log.Printf("config: endpoint=%s language=%s hotkey=%s (from %s)",
+	log.Printf("config: endpoint=%s language=%s hotkey=%s silenceMs=%d (from %s)",
 		appConfig.Endpoint(),
 		appConfig.Language,
 		HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey),
+		appConfig.SilenceDurationMs,
 		cfgPath,
 	)
 	systray.Run(onReady, onExit)
@@ -154,8 +157,8 @@ func applyConfigChange(next Config) {
 	oldHotkey := HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey)
 	newHotkey := HotkeyDisplay(next.HotkeyModifiers, next.HotkeyKey)
 	appConfig = next
-	log.Printf("config updated: endpoint=%s language=%s hotkey=%s notify(color=%v beep=%v)",
-		next.Endpoint(), next.Language, newHotkey,
+	log.Printf("config updated: endpoint=%s language=%s hotkey=%s silenceMs=%d notify(color=%v beep=%v)",
+		next.Endpoint(), next.Language, newHotkey, next.SilenceDurationMs,
 		next.NotifyColorChange, next.NotifyBeep)
 	if oldHotkey != newHotkey {
 		log.Printf("hotkey changed (%s → %s); restart required to apply", oldHotkey, newHotkey)
@@ -219,12 +222,14 @@ func registerHotkey() {
 	log.Printf("hotkey registered: %s", display)
 
 	for {
-		// Wait for the first DOWN that starts a press cycle, then kick off
-		// recording on a worker goroutine inside the Recorder.
+		// Wait for the first DOWN that starts a press cycle, then start
+		// the chunked recorder + the consumer goroutine that ships chunks
+		// to whisper as VAD reports them.
 		<-hk.Keydown()
-		log.Print("hotkey DOWN — recording started")
+		log.Print("hotkey DOWN — streaming started")
 		startRecordingIndicator()
-		rec := StartRecording()
+		rec := StartChunkedRecording(appConfig.SilenceDurationMs)
+		consumerDone := startStreamingConsumer(rec)
 
 		// Drain UP/DOWN pairs caused by auto-repeat until we see an UP
 		// that *isn't* followed by another DOWN within debounceWindow.
@@ -241,18 +246,17 @@ func registerHotkey() {
 					<-timer.C
 				}
 			case <-timer.C:
-				// Genuine release: stop the recorder, persist to disk for
-				// debugging, and ship the PCM off to whisper. The indicator
-				// stops regardless of recording outcome so the icon never
-				// gets stuck in the red state.
+				// Genuine release: stop the recorder. The consumer
+				// goroutine will drain any final chunk and the paste
+				// queue will flush in order. We wait on consumerDone so
+				// the next press doesn't race with in-flight pastes.
 				pcm, err := rec.Stop()
 				stopRecordingIndicator()
 				if err != nil {
 					log.Printf("recording failed: %v", err)
-					break drain
 				}
+				<-consumerDone
 				saveCapturedWAV(pcm)
-				transcribeAndPaste(pcm)
 				break drain
 			}
 		}
@@ -280,39 +284,167 @@ func saveCapturedWAV(pcm []byte) {
 	log.Printf("hotkey UP — recorded %d bytes (%.2fs) → %s", len(pcm), durSec, path)
 }
 
-// transcribeAndPaste ships the captured PCM to the configured whisper
-// endpoint, logs the recognized text, and pastes it into the focused
-// window. We measure wall-clock latency on transcription (the slow step)
-// so regressions are visible at a glance in the log.
+// startStreamingConsumer wires a ChunkedRecorder's output up to whisper
+// and the paste queue. Returns a channel that closes once every chunk
+// has been transcribed AND pasted (or skipped on error). The hotkey loop
+// blocks on this channel after rec.Stop() so the next press can't race
+// with an in-flight paste.
 //
-// The whole thing runs on the hotkey goroutine (synchronously). That's
-// fine for a push-to-talk app — the user is already waiting after release
-// to see the text appear. Going async would only add complexity without
-// improving the perceived experience.
-func transcribeAndPaste(pcm []byte) {
-	if !appConfig.EndpointConfigured() {
-		log.Print("transcribe skipped: whisper_host/whisper_port not set in config.json (right-click tray icon → Settings)")
-		return
-	}
-	start := time.Now()
-	text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, pcm)
-	elapsed := time.Since(start)
-	if err != nil {
-		log.Printf("transcribe failed (%.2fs): %v", elapsed.Seconds(), err)
-		return
-	}
-	log.Printf("transcript (%.2fs): %q", elapsed.Seconds(), text)
+// Concurrency model:
+//
+//   recorder ───chunks───▶ this goroutine
+//                              │ spawns one transcribe goroutine per chunk
+//                              ▼
+//                          transcribe (parallel)
+//                              │ submits result with seq number
+//                              ▼
+//                          orderedPaster (single goroutine, in-order pastes)
+//
+// Transcribes run in parallel because whisper is the slow step and we
+// want to pipeline as much as possible. The orderedPaster reassembles
+// in seq order so chunk 2's text never lands before chunk 1's, even if
+// chunk 2 finished transcribing first.
+func startStreamingConsumer(rec *ChunkedRecorder) <-chan struct{} {
+	done := make(chan struct{})
 
-	// Whisper sometimes returns text with a leading space (its tokenizer
-	// quirk). It looks ugly when pasted into the middle of an existing
-	// sentence, so trim it. Trailing whitespace is fine to leave.
-	if len(text) > 0 && text[0] == ' ' {
-		text = text[1:]
+	if !appConfig.EndpointConfigured() {
+		// Drain chunks but don't try to transcribe — log once and bail.
+		go func() {
+			defer close(done)
+			logged := false
+			for range rec.Chunks() {
+				if !logged {
+					log.Print("transcribe skipped: whisper_host/whisper_port not set (right-click tray → Settings)")
+					logged = true
+				}
+			}
+		}()
+		return done
 	}
+
+	go func() {
+		defer close(done)
+		paster := newOrderedPaster()
+		var wg sync.WaitGroup
+
+		for chunk := range rec.Chunks() {
+			chunk := chunk // capture for goroutine
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start := time.Now()
+				text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, chunk.PCM)
+				elapsed := time.Since(start)
+				if err != nil {
+					log.Printf("chunk %d transcribe failed (%.2fs): %v", chunk.Seq, elapsed.Seconds(), err)
+				} else {
+					log.Printf("chunk %d transcript (%.2fs, %d bytes audio): %q",
+						chunk.Seq, elapsed.Seconds(), len(chunk.PCM), text)
+				}
+				paster.Submit(chunk.Seq, text, err)
+			}()
+		}
+		// All chunks received from the recorder — wait for outstanding
+		// transcribes to deposit results, then close the paster so it
+		// flushes whatever's left in order.
+		wg.Wait()
+		paster.Close()
+	}()
+
+	return done
+}
+
+// orderedPaster receives transcription results out-of-order and pastes
+// them into the focused window in seq order. It owns a single goroutine
+// (started by newOrderedPaster), serializes pastes through a channel,
+// and exits cleanly when Close() is called and all submitted work has
+// been processed.
+type orderedPaster struct {
+	incoming chan pasteResult
+	done     chan struct{}
+}
+
+type pasteResult struct {
+	seq  int
+	text string
+	err  error
+}
+
+func newOrderedPaster() *orderedPaster {
+	p := &orderedPaster{
+		incoming: make(chan pasteResult, 32),
+		done:     make(chan struct{}),
+	}
+	go p.run()
+	return p
+}
+
+// Submit hands a transcription result to the paster. Safe to call from
+// any goroutine. Non-blocking unless the incoming buffer (32 deep) is
+// completely full, which would require 32+ chunks pending paste — very
+// unlikely in practice.
+func (p *orderedPaster) Submit(seq int, text string, err error) {
+	p.incoming <- pasteResult{seq: seq, text: text, err: err}
+}
+
+// Close signals no more submissions are coming and blocks until the
+// paster has drained its queue and pasted everything that can be pasted.
+// Out-of-order tail items (e.g. seq 5 arrived but seq 4 never did) are
+// dropped on close — better than waiting forever for a transcribe that
+// errored mid-flight.
+func (p *orderedPaster) Close() {
+	close(p.incoming)
+	<-p.done
+}
+
+func (p *orderedPaster) run() {
+	defer close(p.done)
+
+	pending := map[int]pasteResult{}
+	nextSeq := 0
+
+	flush := func() {
+		// Paste anything that's now in order.
+		for {
+			r, ok := pending[nextSeq]
+			if !ok {
+				return
+			}
+			delete(pending, nextSeq)
+			p.pasteOne(r, nextSeq)
+			nextSeq++
+		}
+	}
+
+	for r := range p.incoming {
+		pending[r.seq] = r
+		flush()
+	}
+
+	// Channel closed. Anything still in pending is out-of-order tail —
+	// either a transcribe errored before reporting (and we never got
+	// that seq) or sequencing got confused. Either way, drop these
+	// silently; the alternative (blocking forever) is worse.
+}
+
+// pasteOne handles the per-chunk paste logic: trim whitespace, add a
+// leading space if this isn't the first chunk in the session (so words
+// flow together), call Paste(). Errors are logged but don't stop the
+// queue.
+func (p *orderedPaster) pasteOne(r pasteResult, seq int) {
+	if r.err != nil {
+		return // already logged at transcribe site
+	}
+	text := strings.TrimSpace(r.text)
 	if text == "" {
-		return // nothing to paste
+		return
+	}
+	// Chunks after the first get a leading space so consecutive chunks
+	// read as a sentence rather than glued-together words.
+	if seq > 0 {
+		text = " " + text
 	}
 	if err := Paste(text); err != nil {
-		log.Printf("paste failed: %v", err)
+		log.Printf("paste seq %d failed: %v", seq, err)
 	}
 }

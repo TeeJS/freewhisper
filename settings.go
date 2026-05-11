@@ -65,7 +65,7 @@ func OpenSettings() {
 // (since modifiers/key may have changed).
 func runSettingsDialog() error {
 	var dlg *walk.Dialog
-	var serverEdit, portEdit, languageEdit, hotkeyKeyCombo *walk.LineEdit
+	var serverEdit, portEdit, languageEdit, silenceEdit, hotkeyKeyCombo *walk.LineEdit
 	var keyCombo *walk.ComboBox
 	var modCtrl, modAlt, modShift, modWin *walk.CheckBox
 	var notifyColor, notifyBeep *walk.CheckBox
@@ -123,6 +123,15 @@ func runSettingsDialog() error {
 				},
 			},
 			GroupBox{
+				Title:  "Streaming",
+				Layout: Grid{Columns: 2},
+				Children: []Widget{
+					Label{Text: "Silence duration (ms):"},
+					LineEdit{AssignTo: &silenceEdit, Text: strconv.Itoa(current.SilenceDurationMs)},
+					Label{Text: "(How long you must pause for a chunk to be sent. Shorter = more responsive, less accurate. ~400ms is a good starting point.)", ColumnSpan: 2},
+				},
+			},
+			GroupBox{
 				Title:  "Notifications",
 				Layout: VBox{},
 				Children: []Widget{
@@ -171,6 +180,14 @@ func runSettingsDialog() error {
 							}
 							next.NotifyColorChange = notifyColor.Checked()
 							next.NotifyBeep = notifyBeep.Checked()
+							sil, err := strconv.Atoi(silenceEdit.Text())
+							if err != nil || sil < 50 {
+								walk.MsgBox(dlg, "Invalid silence duration",
+									"Silence duration must be a number ≥ 50 (milliseconds).",
+									walk.MsgBoxIconError)
+								return
+							}
+							next.SilenceDurationMs = sil
 							// Persist + apply.
 							if err := next.Save(); err != nil {
 								walk.MsgBox(dlg, "Save failed", err.Error(), walk.MsgBoxIconError)
