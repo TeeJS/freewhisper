@@ -26,21 +26,48 @@ import (
 	"golang.design/x/hotkey"
 )
 
+// Two tray-icon variants embedded at compile time. The idle icon (blue F)
+// shows when the app is sitting waiting for a hotkey; the recording icon
+// (red F) replaces it while the user is holding the chord, but only when
+// the NotifyColorChange setting is on. We swap by calling systray.SetIcon
+// with the appropriate byte slice at runtime.
+
 //go:embed icon.ico
-var iconData []byte
+var iconIdle []byte
+
+//go:embed icon_recording.ico
+var iconRecording []byte
 
 // appConfig holds the runtime configuration. Loaded once at startup and
 // then read-only — we treat config as immutable for the process lifetime.
 // (Hot-reload is a feature we'd add later, after there's any need for it.)
 var appConfig Config
 
+// configExisted tracks whether config.json was present at startup. The
+// settings GUI uses this to auto-open on first run (when false).
+var configExisted bool
+
 func main() {
 	setupLogging()
 	log.Print("freewhisper starting")
 	cfgPath := ""
-	appConfig, cfgPath = LoadConfig()
-	log.Printf("config: endpoint=%s language=%s (from %s)",
-		appConfig.Endpoint(), appConfig.Language, cfgPath)
+	appConfig, cfgPath, configExisted = LoadConfig()
+	if !configExisted {
+		// First run: write the defaults to disk so the user has a file
+		// to inspect/edit and to anchor the settings GUI's auto-open
+		// behavior. Failure to write is logged but non-fatal.
+		if err := appConfig.Save(); err != nil {
+			log.Printf("config: first-run save failed: %v", err)
+		} else {
+			log.Printf("config: wrote default config to %s (first run)", cfgPath)
+		}
+	}
+	log.Printf("config: endpoint=%s language=%s hotkey=%s (from %s)",
+		appConfig.Endpoint(),
+		appConfig.Language,
+		HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey),
+		cfgPath,
+	)
 	systray.Run(onReady, onExit)
 }
 
@@ -81,11 +108,21 @@ func setupLogging() {
 }
 
 func onReady() {
-	systray.SetIcon(iconData)
+	systray.SetIcon(iconIdle)
 	systray.SetTitle("FreeWhisper")
 	systray.SetTooltip("FreeWhisper (idle)")
 
+	// Menu items, in display order: Settings, then a separator, then Quit.
+	// AddMenuItemCheckbox / separator aren't needed yet — keep it minimal.
+	mSettings := systray.AddMenuItem("Settings…", "Open settings window")
+	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Exit FreeWhisper")
+
+	go func() {
+		for range mSettings.ClickedCh {
+			OpenSettings()
+		}
+	}()
 	go func() {
 		<-mQuit.ClickedCh
 		systray.Quit()
@@ -95,18 +132,48 @@ func onReady() {
 	// We spawn the event loop as a goroutine so it runs concurrently with
 	// the systray menu without blocking either side.
 	go registerHotkey()
+
+	// First-run UX: if config.json didn't exist at startup, the user
+	// almost certainly hasn't set the whisper endpoint yet. Pop the
+	// settings window automatically so they don't have to discover the
+	// tray menu first.
+	if !configExisted {
+		OpenSettings()
+	}
+}
+
+// applyConfigChange swaps the running config to next. Server/language/
+// notification settings take effect immediately because all the code
+// paths that consume them read appConfig fresh on each operation
+// (transcribe, indicator). The hotkey, by contrast, was registered with
+// Win32 once at startup and the press loop is blocked on the old object's
+// channels — changing the chord requires a restart. The settings GUI
+// surfaces this caveat in its layout, so we don't duplicate the warning
+// here.
+func applyConfigChange(next Config) {
+	oldHotkey := HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey)
+	newHotkey := HotkeyDisplay(next.HotkeyModifiers, next.HotkeyKey)
+	appConfig = next
+	log.Printf("config updated: endpoint=%s language=%s hotkey=%s notify(color=%v beep=%v)",
+		next.Endpoint(), next.Language, newHotkey,
+		next.NotifyColorChange, next.NotifyBeep)
+	if oldHotkey != newHotkey {
+		log.Printf("hotkey changed (%s → %s); restart required to apply", oldHotkey, newHotkey)
+	}
 }
 
 func onExit() {
 	log.Print("freewhisper exiting")
 }
 
-// registerHotkey registers Ctrl+` (Ctrl+backtick) as a global push-to-talk
-// hotkey and reports debounced press/release events to the log.
+// registerHotkey registers the user-configured push-to-talk chord as a
+// global hotkey and reports debounced press/release events to the log.
 //
-// Why backtick: it's a one-handed two-key chord (Ctrl + the key under Esc),
-// doesn't collide with Excel's Ctrl+Space (column-select), VS Code's
-// Ctrl+Space (autocomplete), or Alt+Space (window system menu).
+// Modifier/key values come from appConfig (see config.go) and get parsed
+// via the lookup tables in hotkeymap.go. Default chord is Ctrl+`
+// (Ctrl+backtick): one-handed reachable, top-left of the keyboard, no
+// collision with Excel's Ctrl+Space (column-select), VS Code's Ctrl+Space
+// (autocomplete), or Alt+Space (window system menu).
 //
 // Why a debounce window: under the hood, golang.design/x/hotkey calls Win32's
 // RegisterHotKey, which causes WM_HOTKEY messages to be re-posted at the
@@ -122,31 +189,41 @@ func onExit() {
 // to see if another DOWN follows. If one does, it was auto-repeat noise; if
 // it doesn't, the release is real.
 func registerHotkey() {
-	// 0xC0 is Win32 VK_OEM_3 — the backtick/tilde key in the top-left corner of
-	// a US keyboard. The hotkey package's public Key constants don't include
-	// the OEM keys, but its Windows implementation passes the Key value
-	// straight through to RegisterHotKey (see hotkey_windows.go:57), so
-	// casting the raw VK is safe.
-	const vkBacktick hotkey.Key = 0xC0
-
 	// 80ms comfortably exceeds the keyboard auto-repeat interval (default
 	// Windows repeat rate is ~30/sec = 33ms; max-fast is around 30ms). If a
 	// user is genuinely tapping the chord faster than 12 times per second to
 	// trigger separate press cycles, they will be merged — acceptable trade.
 	const debounceWindow = 80 * time.Millisecond
 
-	hk := hotkey.New([]hotkey.Modifier{hotkey.ModCtrl}, vkBacktick)
-	if err := hk.Register(); err != nil {
-		log.Printf("hotkey register failed: %v", err)
+	mods, err := ParseModifiers(appConfig.HotkeyModifiers)
+	if err != nil {
+		log.Printf("hotkey register: %v", err)
 		return
 	}
-	log.Print("hotkey registered: Ctrl+`")
+	if len(mods) == 0 {
+		log.Print("hotkey register: at least one modifier (Ctrl/Alt/Shift/Win) required; check config.json")
+		return
+	}
+	key, err := ParseKey(appConfig.HotkeyKey)
+	if err != nil {
+		log.Printf("hotkey register: %v", err)
+		return
+	}
+	display := HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey)
+
+	hk := hotkey.New(mods, key)
+	if err := hk.Register(); err != nil {
+		log.Printf("hotkey register failed (%s): %v", display, err)
+		return
+	}
+	log.Printf("hotkey registered: %s", display)
 
 	for {
 		// Wait for the first DOWN that starts a press cycle, then kick off
 		// recording on a worker goroutine inside the Recorder.
 		<-hk.Keydown()
 		log.Print("hotkey DOWN — recording started")
+		startRecordingIndicator()
 		rec := StartRecording()
 
 		// Drain UP/DOWN pairs caused by auto-repeat until we see an UP
@@ -165,8 +242,11 @@ func registerHotkey() {
 				}
 			case <-timer.C:
 				// Genuine release: stop the recorder, persist to disk for
-				// debugging, and ship the PCM off to whisper.
+				// debugging, and ship the PCM off to whisper. The indicator
+				// stops regardless of recording outcome so the icon never
+				// gets stuck in the red state.
 				pcm, err := rec.Stop()
+				stopRecordingIndicator()
 				if err != nil {
 					log.Printf("recording failed: %v", err)
 					break drain
@@ -210,6 +290,10 @@ func saveCapturedWAV(pcm []byte) {
 // to see the text appear. Going async would only add complexity without
 // improving the perceived experience.
 func transcribeAndPaste(pcm []byte) {
+	if !appConfig.EndpointConfigured() {
+		log.Print("transcribe skipped: whisper_host/whisper_port not set in config.json (right-click tray icon → Settings)")
+		return
+	}
 	start := time.Now()
 	text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, pcm)
 	elapsed := time.Since(start)

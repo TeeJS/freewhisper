@@ -49,9 +49,15 @@ freewhisper/
 ├── recorder.go         ← WASAPI mic capture → []byte WAV
 ├── transcriber.go      ← Wyoming-protocol TCP client (JSONL + binary PCM)
 ├── paster.go           ← clipboard write + SendInput Ctrl+V
-├── config.go           ← config struct, load from config.json
-├── config.example.json ← committed example config (no secrets)
-├── icon.ico            ← tray icon
+├── indicators.go       ← tray-icon color swap + Beep() during recording
+├── settings.go         ← walk-based settings dialog (right-click → Settings…)
+├── hotkeymap.go        ← string ↔ hotkey.Modifier/Key lookups (shared by config + GUI)
+├── config.go           ← Config struct, Load/Save, defaults, first-run detection
+├── config.example.json ← committed example config (placeholder host/port)
+├── icon.ico            ← idle tray icon (blue)
+├── icon_recording.ico  ← recording tray icon (red, shown when NotifyColorChange on)
+├── freewhisper.exe.manifest ← Win32 manifest source (Common Controls v6, DPI awareness)
+├── manifest.syso       ← compiled manifest resource (embedded by `go build`)
 └── build.ps1           ← build script (go build with appropriate flags)
 ```
 
@@ -63,8 +69,18 @@ freewhisper/
 - `golang.design/x/hotkey` — global hotkey registration
 - `github.com/go-ole/go-ole` + `github.com/moutend/go-wca` — WASAPI mic capture (COM wrappers)
 - `golang.org/x/sys/windows` — official Windows syscall bindings, used for SendInput and clipboard
+- `github.com/lxn/walk` + `github.com/lxn/walk/declarative` — Win32 GUI for the settings dialog
 
 All MIT/BSD. No exotic transitive dependencies expected.
+
+**Manifest regeneration:** if you edit `freewhisper.exe.manifest`, regenerate the embedded `.syso` with:
+
+```powershell
+go install github.com/akavel/rsrc@latest
+rsrc -manifest freewhisper.exe.manifest -o manifest.syso -arch amd64
+```
+
+`go build` picks up `manifest.syso` automatically because of its `.syso` extension. The manifest is required for walk's modern Common Controls (v6) — without it, settings-dialog tooltip creation panics.
 
 ## Whisper endpoint
 
