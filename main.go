@@ -1,9 +1,12 @@
 // Package main is the freewhisper entry point.
 //
-// Milestone 3 scope: while the push-to-talk hotkey (Ctrl+`) is held,
-// capture mic audio via WASAPI and write it to test.wav on release. The
-// actual capture and WAV-writing live in recorder.go; this file just wires
-// the hotkey events to start/stop the recording.
+// Milestone 4 scope: while Ctrl+` is held, capture mic audio (recorder.go);
+// on release, send the PCM to the Wyoming whisper server (transcriber.go)
+// and log the transcription. The captured audio is still also written to
+// test.wav for sanity-checking.
+//
+// Endpoint and language come from config.json (loaded at startup, falls
+// back to compiled defaults if missing).
 //
 // We log to a file (not stdout) because the app is built with `-H windowsgui`,
 // which suppresses the console window. Anything written to stdout/stderr in
@@ -25,9 +28,18 @@ import (
 //go:embed icon.ico
 var iconData []byte
 
+// appConfig holds the runtime configuration. Loaded once at startup and
+// then read-only — we treat config as immutable for the process lifetime.
+// (Hot-reload is a feature we'd add later, after there's any need for it.)
+var appConfig Config
+
 func main() {
 	setupLogging()
 	log.Print("freewhisper starting")
+	cfgPath := ""
+	appConfig, cfgPath = LoadConfig()
+	log.Printf("config: endpoint=%s language=%s (from %s)",
+		appConfig.Endpoint(), appConfig.Language, cfgPath)
 	systray.Run(onReady, onExit)
 }
 
@@ -151,13 +163,15 @@ func registerHotkey() {
 					<-timer.C
 				}
 			case <-timer.C:
-				// Genuine release: stop the recorder and persist to disk.
+				// Genuine release: stop the recorder, persist to disk for
+				// debugging, and ship the PCM off to whisper.
 				pcm, err := rec.Stop()
 				if err != nil {
 					log.Printf("recording failed: %v", err)
 					break drain
 				}
 				saveCapturedWAV(pcm)
+				transcribeAndLog(pcm)
 				break drain
 			}
 		}
@@ -183,4 +197,24 @@ func saveCapturedWAV(pcm []byte) {
 	// blockAlign = channels * bitsPerSample/8 = 1 * 2 = 2.
 	durSec := float64(len(pcm)) / float64(captureSampleRate*uint32(captureChannels*captureBitsPerSample/8))
 	log.Printf("hotkey UP — recorded %d bytes (%.2fs) → %s", len(pcm), durSec, path)
+}
+
+// transcribeAndLog ships the captured PCM to the configured whisper endpoint
+// and logs the recognized text (or an error). We measure wall-clock latency
+// here so we can see how fast/slow the round-trip really is — useful when
+// tuning later, and a good reality-check that the server is healthy.
+//
+// The whole thing runs on the hotkey goroutine (synchronously). That's
+// fine for a push-to-talk app — the user is already waiting after release
+// to see the text appear. Going async would only add complexity without
+// improving the perceived experience.
+func transcribeAndLog(pcm []byte) {
+	start := time.Now()
+	text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, pcm)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Printf("transcribe failed (%.2fs): %v", elapsed.Seconds(), err)
+		return
+	}
+	log.Printf("transcript (%.2fs): %q", elapsed.Seconds(), text)
 }

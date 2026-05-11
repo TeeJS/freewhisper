@@ -1,0 +1,5 @@
+{
+  "whisper_host": "192.168.1.25",
+  "whisper_port": 10300,
+  "language": "en"
+}
