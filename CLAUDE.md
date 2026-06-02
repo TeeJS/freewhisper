@@ -24,18 +24,25 @@ A Wispr Flow alternative for Windows. Push-to-talk dictation that captures mic a
        ↓
 [WASAPI mic capture starts → PCM bytes in memory]
        ↓
-[hotkey released]
+[VAD splits the stream into chunks at speech pauses]   ← streaming: happens while held
        ↓
-[wrap PCM in WAV header]
+[each chunk → Wyoming-protocol TCP send to whisper endpoint (transcribes in parallel)]
        ↓
-[HTTP multipart POST to whisper endpoint]
+[ordered paste queue reassembles transcripts in sequence]
        ↓
-[parse JSON, extract text]
+[clipboard SetText + SendInput Ctrl+V into active window, in order]
        ↓
-[clipboard SetText + SendInput Ctrl+V into active window]
+[hotkey released → final chunk flushed, queue drains]
        ↓
 [idle, wait for next hotkey press]
 ```
+
+The original design was batch (record-all-then-POST over OpenAI-compatible
+HTTP). It's since become **streaming over the Wyoming protocol**: a VAD
+(`vad.go`) cuts the audio into utterance-sized chunks at natural pauses, each
+is transcribed as it's ready, and a sequence-numbered paste queue keeps the
+output in order even when chunks finish out of order. See "Whisper endpoint"
+below.
 
 ## File layout
 
@@ -58,9 +65,10 @@ freewhisper/
 ├── icon.ico            ← idle tray icon (blue)
 ├── icon_recording.ico  ← recording tray icon (red, shown when NotifyColorChange on)
 ├── freewhisper.exe.manifest ← Win32 manifest source (Common Controls v6, DPI awareness)
-├── manifest.syso       ← compiled manifest resource (embedded by `go build`)
-└── build.ps1           ← build script (go build with appropriate flags)
+└── manifest.syso       ← compiled manifest resource (embedded by `go build`)
 ```
+
+There is no build script; build with the `go build` command under "Build" below.
 
 `config.json` is gitignored. `config.example.json` is committed.
 

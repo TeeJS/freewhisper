@@ -275,7 +275,15 @@ func registerHotkey() {
 					log.Printf("recording failed: %v", err)
 				}
 				<-consumerDone
-				saveCapturedWAV(pcm)
+				// test.wav is a capture-debugging aid, not a normal-use
+				// feature: writing every dictation to disk is wasteful and a
+				// privacy footgun (your spoken words land in an unencrypted
+				// file). Off by default — set the FREEWHISPER_DEBUG_WAV
+				// environment variable (to any non-empty value) to re-enable
+				// it for a debugging session.
+				if os.Getenv("FREEWHISPER_DEBUG_WAV") != "" {
+					saveCapturedWAV(pcm)
+				}
 				break drain
 			}
 		}
@@ -286,6 +294,9 @@ func registerHotkey() {
 // %LOCALAPPDATA%\freewhisper\, alongside debug.log. We log the byte count,
 // the implied duration, and the full path so the user can find and play
 // back the file to sanity-check the capture.
+//
+// Only called when FREEWHISPER_DEBUG_WAV is set (see the call site) — it's a
+// debugging aid, not something that should run on every dictation.
 func saveCapturedWAV(pcm []byte) {
 	appData := os.Getenv("LOCALAPPDATA")
 	if appData == "" {
