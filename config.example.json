@@ -6,5 +6,6 @@
   "hotkey_key": "Backtick",
   "notify_color_change": false,
   "notify_beep": false,
+  "restore_clipboard": false,
   "silence_duration_ms": 400
 }

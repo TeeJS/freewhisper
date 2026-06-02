@@ -68,7 +68,7 @@ func runSettingsDialog() error {
 	var serverEdit, portEdit, languageEdit, silenceEdit, hotkeyKeyCombo *walk.LineEdit
 	var keyCombo *walk.ComboBox
 	var modCtrl, modAlt, modShift, modWin *walk.CheckBox
-	var notifyColor, notifyBeep *walk.CheckBox
+	var notifyColor, notifyBeep, restoreClipboard *walk.CheckBox
 	var okBtn, cancelBtn *walk.PushButton
 	_ = hotkeyKeyCombo // silence linter — placeholder if we ever swap LineEdit for ComboBox
 
@@ -139,6 +139,14 @@ func runSettingsDialog() error {
 					CheckBox{AssignTo: &notifyBeep, Text: "Beep on record start/stop", Checked: current.NotifyBeep},
 				},
 			},
+			GroupBox{
+				Title:  "Pasting",
+				Layout: VBox{},
+				Children: []Widget{
+					CheckBox{AssignTo: &restoreClipboard, Text: "Restore previous clipboard after pasting", Checked: current.RestoreClipboard},
+					Label{Text: "(Leave OFF for reliable pasting. When ON, restoring your old clipboard can race the paste on some PCs and cause the wrong text to land.)"},
+				},
+			},
 			Composite{
 				Layout: HBox{},
 				Children: []Widget{
@@ -180,6 +188,7 @@ func runSettingsDialog() error {
 							}
 							next.NotifyColorChange = notifyColor.Checked()
 							next.NotifyBeep = notifyBeep.Checked()
+							next.RestoreClipboard = restoreClipboard.Checked()
 							sil, err := strconv.Atoi(silenceEdit.Text())
 							if err != nil || sil < 50 {
 								walk.MsgBox(dlg, "Invalid silence duration",

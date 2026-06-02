@@ -14,11 +14,12 @@
 //      than they handle synthetic per-character input (the latter trips
 //      up rich-text editors, web inputs with autocomplete, etc.).
 //
-// The trade is that we have to touch the user's clipboard. We mitigate by
-// saving the current clipboard text first and restoring it after the paste
-// completes. Non-text clipboard contents (images, files) aren't preserved
-// — we'd need to enumerate all clipboard formats to handle that, and it's
-// not worth the complexity for a dictation tool. Documented limitation.
+// The trade is that we have to touch the user's clipboard. By default we
+// leave the transcript on it (the reliable choice — see Paste for why).
+// Optionally (the RestoreClipboard config option) we save the prior clipboard
+// text first and put it back after pasting. Non-text clipboard contents
+// (images, files) aren't preserved either way — enumerating all clipboard
+// formats isn't worth the complexity for a dictation tool. Documented limitation.
 //
 // Win32 surface this file touches:
 //   user32!OpenClipboard, CloseClipboard, EmptyClipboard
@@ -107,43 +108,57 @@ type keyboardInput struct {
 	_         [8]byte // tail pad: match MOUSEINPUT's 32-byte union size
 }
 
-// Paste places text on the clipboard, sends a Ctrl+V to whatever window has
-// keyboard focus, and restores the prior clipboard contents (text only).
+// Paste places text on the clipboard and sends Ctrl+V to whatever window has
+// keyboard focus. By default it then LEAVES the transcript on the clipboard;
+// only if the RestoreClipboard config option is on does it put the user's
+// prior clipboard text back afterward.
 //
-// Errors are reported but the function tries to make best-effort progress —
-// for example, if we can't read the original clipboard we still go ahead
-// with the paste, just without restoring afterwards.
+// Why default to not restoring: restoring means "write transcript → paste →
+// write the old text back," and on machines with clipboard-monitoring/DLP
+// software (or any slow clipboard handoff) that final write can race the
+// target app's paste — so the OLD clipboard lands instead of the transcript.
+// We confirmed exactly that on a corporate machine. Leaving the transcript on
+// the clipboard sidesteps the race completely, at the cost of clobbering
+// whatever the user had copied. Restoring is opt-in for fast machines where
+// preserving the clipboard matters more than the small risk.
+//
+// Errors are reported but the function makes best-effort progress.
 func Paste(text string) error {
 	if text == "" {
 		return nil // nothing to paste
 	}
 
-	// 1. Snapshot the current clipboard text so we can put it back. If the
-	//    clipboard has non-text data (image, file list, etc.), saved will
-	//    be empty and we won't restore that data — known limitation.
-	saved, savedOK := readClipboardText()
+	restore := currentConfig().RestoreClipboard
 
-	// 2. Put our text on the clipboard.
+	// Only snapshot the old clipboard if we actually intend to put it back.
+	var saved string
+	var savedOK bool
+	if restore {
+		saved, savedOK = readClipboardText()
+	}
+
+	// Put our text on the clipboard.
 	if err := writeClipboardText(text); err != nil {
 		return fmt.Errorf("set clipboard: %w", err)
 	}
 
-	// 3. Synthesize Ctrl+V keystrokes. The target app receives this and
-	//    pastes from the clipboard normally (just as if the user pressed
-	//    Ctrl+V themselves).
+	// Synthesize Ctrl+V. The target app pastes from the clipboard exactly as
+	// if the user had pressed Ctrl+V themselves.
 	if err := sendCtrlV(); err != nil {
 		return fmt.Errorf("send Ctrl+V: %w", err)
 	}
 
-	// 4. Give the target app a moment to consume the paste. Without this
-	//    delay we'd race ahead and restore the previous clipboard before
-	//    the target has finished pulling our text out. 80ms is enough for
-	//    every desktop app I've tested; if you find a slow one, raise it.
-	time.Sleep(80 * time.Millisecond)
+	if !restore {
+		// Reliable path: leave the transcript on the clipboard and return.
+		// We never change the clipboard out from under the target, so there's
+		// nothing for its paste to race against.
+		return nil
+	}
 
-	// 5. Restore the previous clipboard text. If we never saved anything
-	//    (no prior text), just empty the clipboard so we're not leaving
-	//    the transcript hanging around for the next Ctrl+V.
+	// Restore path: give the target a moment to consume the paste before we
+	// overwrite the clipboard with the saved text. This sleep is the race
+	// window the default path avoids entirely.
+	time.Sleep(80 * time.Millisecond)
 	if savedOK {
 		if err := writeClipboardText(saved); err != nil {
 			return fmt.Errorf("restore clipboard: %w", err)
