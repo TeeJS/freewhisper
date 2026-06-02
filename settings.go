@@ -66,7 +66,7 @@ func OpenSettings() {
 func runSettingsDialog() error {
 	var dlg *walk.Dialog
 	var serverEdit, portEdit, languageEdit, silenceEdit, hotkeyKeyCombo *walk.LineEdit
-	var keyCombo *walk.ComboBox
+	var keyCombo, micCombo *walk.ComboBox
 	var modCtrl, modAlt, modShift, modWin *walk.CheckBox
 	var notifyColor, notifyBeep, restoreClipboard *walk.CheckBox
 	var okBtn, cancelBtn *walk.PushButton
@@ -79,10 +79,36 @@ func runSettingsDialog() error {
 		hasMod[m] = true
 	}
 
+	// Enumerate microphones for the device picker. "System Default" (empty ID)
+	// is always first; the rest come from WASAPI. micNames drives the dropdown;
+	// micIDs is the parallel list of endpoint IDs we actually persist. If
+	// enumeration fails we just offer "System Default" and log it.
+	micNames := []string{"System Default"}
+	micIDs := []string{""}
+	if devs, derr := listCaptureDevices(); derr != nil {
+		log.Printf("settings: could not list microphones: %v", derr)
+	} else {
+		for _, d := range devs {
+			label := d.Name
+			if label == "" {
+				label = d.ID
+			}
+			micNames = append(micNames, label)
+			micIDs = append(micIDs, d.ID)
+		}
+	}
+	micIndex := 0
+	for i, id := range micIDs {
+		if id == current.MicDeviceID {
+			micIndex = i
+			break
+		}
+	}
+
 	err := (Dialog{
 		AssignTo:      &dlg,
 		Title:         "FreeWhisper Settings",
-		MinSize:       Size{Width: 380, Height: 400},
+		MinSize:       Size{Width: 380, Height: 480},
 		Layout:        VBox{},
 		DefaultButton: &okBtn,
 		CancelButton:  &cancelBtn,
@@ -97,6 +123,19 @@ func runSettingsDialog() error {
 					LineEdit{AssignTo: &portEdit, Text: strconv.Itoa(current.WhisperPort)},
 					Label{Text: "Language:"},
 					LineEdit{AssignTo: &languageEdit, Text: current.Language},
+				},
+			},
+			GroupBox{
+				Title:  "Microphone",
+				Layout: VBox{},
+				Children: []Widget{
+					Label{Text: "Capture device:"},
+					ComboBox{
+						AssignTo:     &micCombo,
+						Model:        micNames,
+						CurrentIndex: micIndex,
+					},
+					Label{Text: "(\"System Default\" follows your Windows default mic. Applies on your next dictation.)"},
 				},
 			},
 			GroupBox{
@@ -165,6 +204,10 @@ func runSettingsDialog() error {
 							}
 							next.WhisperPort = p
 							next.Language = languageEdit.Text()
+							// micCombo's index lines up with micIDs ([0] = "" = system default).
+							if i := micCombo.CurrentIndex(); i >= 0 && i < len(micIDs) {
+								next.MicDeviceID = micIDs[i]
+							}
 							var mods []string
 							if modCtrl.Checked() {
 								mods = append(mods, "Ctrl")

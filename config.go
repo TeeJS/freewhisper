@@ -36,6 +36,13 @@ type Config struct {
 	// selection. "en" for English. Empty lets whisper auto-detect.
 	Language string `json:"language"`
 
+	// MicDeviceID is the WASAPI endpoint ID of the capture device to record
+	// from. Empty = follow the Windows default microphone. The value is the
+	// opaque ID string from IMMDevice::GetId; the settings GUI shows friendly
+	// names and stores the matching ID. If the saved device is missing at
+	// record time, the recorder falls back to the default (see audiodevices.go).
+	MicDeviceID string `json:"mic_device_id"`
+
 	// HotkeyModifiers lists the modifier keys that must be held alongside
 	// HotkeyKey. Valid entries: "Ctrl", "Alt", "Shift", "Win" (case-
 	// insensitive on load). RegisterHotKey requires at least one modifier;
@@ -89,6 +96,7 @@ func DefaultConfig() Config {
 		WhisperHost:       "",
 		WhisperPort:       10300, // safe to default — same on every Wyoming install
 		Language:          "en",
+		MicDeviceID:       "", // follow the Windows default mic
 		HotkeyModifiers:   []string{"Ctrl"},
 		HotkeyKey:         "Backtick",
 		NotifyColorChange: false,
@@ -144,6 +152,11 @@ func LoadConfig() (Config, string, bool) {
 	}
 	if fromFile.Language != "" {
 		cfg.Language = fromFile.Language
+	}
+	// Empty MicDeviceID means "system default", which is also the zero value,
+	// so non-empty-overwrite is exactly right here.
+	if fromFile.MicDeviceID != "" {
+		cfg.MicDeviceID = fromFile.MicDeviceID
 	}
 	if len(fromFile.HotkeyModifiers) > 0 {
 		cfg.HotkeyModifiers = fromFile.HotkeyModifiers
