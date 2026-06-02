@@ -170,3 +170,96 @@ func findCaptureDeviceByID(mmde *wca.IMMDeviceEnumerator, wantID string) (*wca.I
 	}
 	return nil, nil
 }
+
+// volScalar converts a 0–100 percent to the 0.0–1.0 scalar WASAPI's
+// IAudioEndpointVolume expects, clamping out-of-range input.
+func volScalar(pct int) float32 {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return float32(pct) / 100
+}
+
+// setDeviceVolume sets an already-acquired capture device's master input level
+// (0–100%). Called from the recorder's COM context, where it already holds the
+// device. This is the *Windows* mic level — system-wide, the same slider you'd
+// move in Sound settings — so it affects every app, by design.
+func setDeviceVolume(device *wca.IMMDevice, pct int) error {
+	var aev *wca.IAudioEndpointVolume
+	if err := device.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+		return fmt.Errorf("Activate(IAudioEndpointVolume): %w", err)
+	}
+	defer aev.Release()
+	return aev.SetMasterVolumeLevelScalar(volScalar(pct), nil)
+}
+
+// withEndpointVolume resolves the capture device (configured ID, or the Windows
+// default when empty/missing) on its own isolated COM thread, activates
+// IAudioEndpointVolume, and runs fn. Used by the settings dialog to read and
+// apply the level without touching walk's or the recorder's COM apartment.
+func withEndpointVolume(deviceID string, fn func(aev *wca.IAudioEndpointVolume) error) error {
+	ch := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+			if oerr, ok := err.(*ole.OleError); !ok || oerr.Code() != 1 {
+				ch <- fmt.Errorf("CoInitializeEx: %w", err)
+				return
+			}
+		}
+		defer ole.CoUninitialize()
+
+		var mmde *wca.IMMDeviceEnumerator
+		if err := wca.CoCreateInstance(
+			wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
+			wca.IID_IMMDeviceEnumerator, &mmde,
+		); err != nil {
+			ch <- fmt.Errorf("CoCreateInstance(MMDeviceEnumerator): %w", err)
+			return
+		}
+		defer mmde.Release()
+
+		device, err := acquireCaptureDevice(mmde, deviceID)
+		if err != nil {
+			ch <- err
+			return
+		}
+		defer device.Release()
+
+		var aev *wca.IAudioEndpointVolume
+		if err := device.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+			ch <- fmt.Errorf("Activate(IAudioEndpointVolume): %w", err)
+			return
+		}
+		defer aev.Release()
+
+		ch <- fn(aev)
+	}()
+	return <-ch
+}
+
+// applyCaptureVolume sets the input level (0–100%) of the given device now.
+func applyCaptureVolume(deviceID string, pct int) error {
+	return withEndpointVolume(deviceID, func(aev *wca.IAudioEndpointVolume) error {
+		return aev.SetMasterVolumeLevelScalar(volScalar(pct), nil)
+	})
+}
+
+// readCaptureVolume returns the device's current input level as 0–100%.
+func readCaptureVolume(deviceID string) (int, error) {
+	var pct int
+	err := withEndpointVolume(deviceID, func(aev *wca.IAudioEndpointVolume) error {
+		var s float32
+		if err := aev.GetMasterVolumeLevelScalar(&s); err != nil {
+			return err
+		}
+		pct = int(s*100 + 0.5) // round to nearest percent
+		return nil
+	})
+	return pct, err
+}

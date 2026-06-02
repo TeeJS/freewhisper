@@ -170,11 +170,24 @@ func (r *ChunkedRecorder) captureLoop() ([]byte, error) {
 	//    set, otherwise the Windows default capture device. acquireCaptureDevice
 	//    falls back to the default if a configured device has gone missing
 	//    (unplugged USB mic, disabled, renamed).
-	device, err := acquireCaptureDevice(deviceEnumerator, currentConfig().MicDeviceID)
+	cfg := currentConfig()
+	device, err := acquireCaptureDevice(deviceEnumerator, cfg.MicDeviceID)
 	if err != nil {
 		return nil, err
 	}
 	defer device.Release()
+
+	// 3a. If the user opted to manage the input level, set it before capturing
+	//     so the recording level is consistent regardless of what other apps
+	//     did to the Windows mic volume. Best-effort: a failure just leaves the
+	//     level as-is and we carry on.
+	if cfg.MicVolumeManage {
+		if err := setDeviceVolume(device, cfg.MicVolume); err != nil {
+			log.Printf("mic: could not set input level to %d%%: %v", cfg.MicVolume, err)
+		} else {
+			log.Printf("mic: set input level to %d%%", cfg.MicVolume)
+		}
+	}
 
 	// 4. Activate IAudioClient.
 	var audioClient *wca.IAudioClient
