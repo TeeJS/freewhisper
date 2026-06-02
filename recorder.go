@@ -166,10 +166,13 @@ func (r *ChunkedRecorder) captureLoop() ([]byte, error) {
 	}
 	defer deviceEnumerator.Release()
 
-	// 3. Default capture (eCapture=1) device for console (eConsole=0) role.
-	var device *wca.IMMDevice
-	if err := deviceEnumerator.GetDefaultAudioEndpoint(1, 0, &device); err != nil {
-		return nil, fmt.Errorf("GetDefaultAudioEndpoint(eCapture, eConsole): %w", err)
+	// 3. Capture device: the user's configured mic (config.MicDeviceID) if
+	//    set, otherwise the Windows default capture device. acquireCaptureDevice
+	//    falls back to the default if a configured device has gone missing
+	//    (unplugged USB mic, disabled, renamed).
+	device, err := acquireCaptureDevice(deviceEnumerator, currentConfig().MicDeviceID)
+	if err != nil {
+		return nil, err
 	}
 	defer device.Release()
 

@@ -2,6 +2,7 @@
   "whisper_host": "10.0.0.10",
   "whisper_port": 10300,
   "language": "en",
+  "mic_device_id": "",
   "hotkey_modifiers": ["Ctrl"],
   "hotkey_key": "Backtick",
   "notify_color_change": false,
