@@ -127,6 +127,11 @@ func runSettingsDialog() error {
 	var meterTickStop chan struct{}
 	meterRunning := false
 
+	// dialogReady gates handlers that would otherwise fire while the dialog is
+	// still being constructed (e.g. the volume slider's initial Value set must
+	// NOT push a level change to the system mic). Flipped true after Create().
+	dialogReady := false
+
 	stopMeter := func() {
 		if !meterRunning {
 			return
@@ -215,7 +220,29 @@ func runSettingsDialog() error {
 					},
 					Label{Text: "(\"System Default\" follows your Windows default mic. Applies on your next dictation.)"},
 					CheckBox{AssignTo: &manageVolume, Text: "Set input level on each recording", Checked: current.MicVolumeManage},
-					Slider{AssignTo: &volSlider, MinValue: 0, MaxValue: 100, Value: volValue},
+					Slider{
+						AssignTo: &volSlider,
+						MinValue: 0,
+						MaxValue: 100,
+						Value:    volValue,
+						OnValueChanged: func() {
+							// Apply the level live (Tracking is off, so this
+							// fires on thumb release) so the meter reflects it as
+							// you tune, and the slider acts as a real mic-level
+							// control — not just a value saved on OK. Guarded so
+							// the initial Value set during construction is inert.
+							if !dialogReady {
+								return
+							}
+							id := ""
+							if i := micCombo.CurrentIndex(); i >= 0 && i < len(micIDs) {
+								id = micIDs[i]
+							}
+							if verr := applyCaptureVolume(id, volSlider.Value()); verr != nil {
+								log.Printf("settings: live mic level apply failed: %v", verr)
+							}
+						},
+					},
 					Label{Text: "(System-wide: changes the Windows mic level for every app, not just FreeWhisper.)"},
 					CheckBox{
 						AssignTo: &showMeter,
@@ -364,6 +391,9 @@ func runSettingsDialog() error {
 	if err != nil {
 		return err
 	}
+	// The dialog is fully built; interactive handlers (live volume apply) may
+	// now act.
+	dialogReady = true
 
 	// Center on screen and run the modal loop. Run() returns once the dialog
 	// is dismissed (OK/Cancel/Esc/X), so this covers every close path.
