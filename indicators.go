@@ -38,11 +38,12 @@ const (
 // indicators are non-essential UX (we shouldn't tank a recording over a
 // failed Beep call).
 func startRecordingIndicator() {
-	if appConfig.NotifyColorChange {
+	cfg := currentConfig()
+	if cfg.NotifyColorChange {
 		systray.SetIcon(iconRecording)
 		systray.SetTooltip("FreeWhisper (recording…)")
 	}
-	if appConfig.NotifyBeep {
+	if cfg.NotifyBeep {
 		beep(beepStartFreqHz, beepDurationMs)
 	}
 }
@@ -52,11 +53,12 @@ func startRecordingIndicator() {
 // color-change setting is on, even if the recording errored out, so the
 // user isn't left looking at a stuck red icon.
 func stopRecordingIndicator() {
-	if appConfig.NotifyColorChange {
+	cfg := currentConfig()
+	if cfg.NotifyColorChange {
 		systray.SetIcon(iconIdle)
 		systray.SetTooltip("FreeWhisper (idle)")
 	}
-	if appConfig.NotifyBeep {
+	if cfg.NotifyBeep {
 		beep(beepStopFreqHz, beepDurationMs)
 	}
 }
