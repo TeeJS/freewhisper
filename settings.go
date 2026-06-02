@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -68,8 +69,9 @@ func runSettingsDialog() error {
 	var serverEdit, portEdit, languageEdit, silenceEdit, hotkeyKeyCombo *walk.LineEdit
 	var keyCombo, micCombo *walk.ComboBox
 	var modCtrl, modAlt, modShift, modWin *walk.CheckBox
-	var notifyColor, notifyBeep, restoreClipboard, manageVolume *walk.CheckBox
+	var notifyColor, notifyBeep, restoreClipboard, manageVolume, showMeter *walk.CheckBox
 	var volSlider *walk.Slider
+	var levelBar *walk.ProgressBar
 	var okBtn, cancelBtn *walk.PushButton
 	_ = hotkeyKeyCombo // silence linter — placeholder if we ever swap LineEdit for ComboBox
 
@@ -116,6 +118,63 @@ func runSettingsDialog() error {
 		}
 	}
 
+	// Live "test mic" level meter. Not persisted — it's a momentary test mode.
+	// While on, a levelMonitor captures from the selected device and a ticker
+	// goroutine pushes the peak into the progress bar (on the GUI thread via
+	// dlg.Synchronize). Torn down when unchecked, when the device changes, and
+	// when the dialog closes (the post-Run stopMeter() below).
+	var meter *levelMonitor
+	var meterTickStop chan struct{}
+	meterRunning := false
+
+	stopMeter := func() {
+		if !meterRunning {
+			return
+		}
+		meterRunning = false
+		close(meterTickStop)
+		if meter != nil {
+			meter.Stop()
+			meter = nil
+		}
+	}
+	startMeter := func() {
+		if meterRunning {
+			return
+		}
+		id := ""
+		if i := micCombo.CurrentIndex(); i >= 0 && i < len(micIDs) {
+			id = micIDs[i]
+		}
+		meter = startLevelMonitor(id)
+		meterTickStop = make(chan struct{})
+		meterRunning = true
+		go func(stop chan struct{}, mon *levelMonitor) {
+			t := time.NewTicker(80 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					// Final frame: zero the bar (runs only if the dialog is
+					// still alive; a no-op once it's closed).
+					dlg.Synchronize(func() {
+						if levelBar != nil {
+							levelBar.SetValue(0)
+						}
+					})
+					return
+				case <-t.C:
+					lvl := mon.Level()
+					dlg.Synchronize(func() {
+						if levelBar != nil {
+							levelBar.SetValue(lvl)
+						}
+					})
+				}
+			}
+		}(meterTickStop, meter)
+	}
+
 	err := (Dialog{
 		AssignTo:      &dlg,
 		Title:         "FreeWhisper Settings",
@@ -144,12 +203,33 @@ func runSettingsDialog() error {
 					ComboBox{
 						AssignTo:     &micCombo,
 						Model:        micNames,
-						CurrentIndex: micIndex,
+						CurrentIndex:  micIndex,
+						OnCurrentIndexChanged: func() {
+							// Re-point the live meter at the newly selected
+							// device so you can compare mics on the fly.
+							if meterRunning {
+								stopMeter()
+								startMeter()
+							}
+						},
 					},
 					Label{Text: "(\"System Default\" follows your Windows default mic. Applies on your next dictation.)"},
 					CheckBox{AssignTo: &manageVolume, Text: "Set input level on each recording", Checked: current.MicVolumeManage},
 					Slider{AssignTo: &volSlider, MinValue: 0, MaxValue: 100, Value: volValue},
 					Label{Text: "(System-wide: changes the Windows mic level for every app, not just FreeWhisper.)"},
+					CheckBox{
+						AssignTo: &showMeter,
+						Text:     "Test microphone (show live input level)",
+						OnClicked: func() {
+							if showMeter.Checked() {
+								startMeter()
+							} else {
+								stopMeter()
+							}
+						},
+					},
+					ProgressBar{AssignTo: &levelBar, MinValue: 0, MaxValue: 100, Value: 0},
+					Label{Text: "(Speak and watch the bar. Flat bar = the mic isn't hearing you; raise the level or pick another device.)"},
 				},
 			},
 			GroupBox{
@@ -285,8 +365,13 @@ func runSettingsDialog() error {
 		return err
 	}
 
-	// Center on screen and run the modal loop.
+	// Center on screen and run the modal loop. Run() returns once the dialog
+	// is dismissed (OK/Cancel/Esc/X), so this covers every close path.
 	dlg.Run()
+
+	// Tear down the level meter if it was running — stop the capture thread and
+	// release the device. Safe to call when it's already stopped.
+	stopMeter()
 	return nil
 }
 
