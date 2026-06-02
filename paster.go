@@ -60,6 +60,7 @@ var (
 	procGlobalAlloc  = kernel32.NewProc("GlobalAlloc")
 	procGlobalLock   = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock = kernel32.NewProc("GlobalUnlock")
+	procGlobalFree   = kernel32.NewProc("GlobalFree")
 )
 
 // Win32 constants used below. Lowercase first letter = package-private.
@@ -226,8 +227,11 @@ func writeClipboardText(text string) error {
 	// need to free it ourselves — keep that branch honest.
 	r, _, _ = procSetClipboardData.Call(cfUnicodeText, hMem)
 	if r == 0 {
-		// Failure: we still own the memory, so release it before bailing.
-		// (LocalFree, GlobalFree, both work — GlobalFree is the textbook pair.)
+		// Failure: ownership did NOT transfer to the clipboard, so the
+		// HGLOBAL is still ours and would leak if we just returned. Free it.
+		// GlobalFree returns NULL on success; we're bailing regardless, so
+		// this is best-effort and we don't inspect the result.
+		procGlobalFree.Call(hMem)
 		return errors.New("SetClipboardData failed")
 	}
 	return nil
