@@ -64,6 +64,12 @@ type VAD struct {
 	// "silence" during calibration so we don't accidentally cut a chunk
 	// at frame 1).
 	calibrated bool
+
+	// calibrationSuspect is set when the measured noise floor exceeded
+	// noiseFloorCeiling — i.e. calibration almost certainly caught speech
+	// instead of ambient noise, and we fell back to minThreshold. Exposed
+	// for diagnostic logging so the user can spot "I talked too soon" cases.
+	calibrationSuspect bool
 }
 
 const (
@@ -84,6 +90,21 @@ const (
 	// of 0 (everything = speech). Tuned against the int16 amplitude
 	// scale: roughly 0.3% of full scale.
 	minThreshold = 100.0
+
+	// noiseFloorCeiling is the RMS above which we refuse to believe a
+	// calibration result is really the ambient noise floor. Calibration
+	// assumes the first 200 ms of a press is silence; if the user starts
+	// talking immediately, it instead measures their voice, computes a
+	// speech-level "floor," and sets the threshold so high it swallows the
+	// rest of the utterance (worst case: nothing is transcribed at all).
+	//
+	// Spoken-voice frames sit in the low thousands of RMS; a quiet dictation
+	// environment's ambient noise is tens to low hundreds. 1500 sits well
+	// above any realistic ambient floor but below conversational speech, so
+	// it trips only when calibration genuinely caught the user's voice. It's
+	// a conservative guess pending real-world data — the recorder logs the
+	// measured floor every press so this can be tuned later.
+	noiseFloorCeiling = 1500.0
 )
 
 // NewVAD returns a fresh detector. Call ProcessFrame on each 20ms frame.
@@ -104,7 +125,20 @@ func (v *VAD) IsSpeech(frame []byte) bool {
 		v.calibrationSamples = append(v.calibrationSamples, rms)
 		if len(v.calibrationSamples) >= calibrationFrames {
 			v.noiseFloor = median(v.calibrationSamples)
-			v.threshold = math.Max(v.noiseFloor*thresholdMultiplier, minThreshold)
+			if v.noiseFloor > noiseFloorCeiling {
+				// The "ambient" measurement is implausibly loud — the user
+				// almost certainly spoke during the 200 ms calibration
+				// window, so this isn't a real noise floor. Trusting it would
+				// set the threshold above their own voice and swallow the
+				// utterance. Fall back to the minimum threshold: we'd rather
+				// under-segment (treat borderline frames as speech, yielding
+				// one big chunk) than lose audio entirely. noiseFloor keeps
+				// the raw measured value so the log can report what happened.
+				v.threshold = minThreshold
+				v.calibrationSuspect = true
+			} else {
+				v.threshold = math.Max(v.noiseFloor*thresholdMultiplier, minThreshold)
+			}
 			v.calibrated = true
 		}
 		return false
@@ -121,6 +155,11 @@ func (v *VAD) NoiseFloor() float64 { return v.noiseFloor }
 
 // Calibrated reports whether calibration has completed.
 func (v *VAD) Calibrated() bool { return v.calibrated }
+
+// CalibrationSuspect reports whether calibration was rejected as
+// speech-contaminated (measured noise floor above noiseFloorCeiling), in
+// which case the threshold fell back to minThreshold. For diagnostics.
+func (v *VAD) CalibrationSuspect() bool { return v.calibrationSuspect }
 
 // frameRMS computes the root-mean-square amplitude of a 16-bit LE PCM frame.
 // Returns a value in the int16 amplitude range (0 to ~32767).
