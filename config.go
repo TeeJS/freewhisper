@@ -43,6 +43,15 @@ type Config struct {
 	// record time, the recorder falls back to the default (see audiodevices.go).
 	MicDeviceID string `json:"mic_device_id"`
 
+	// MicVolumeManage, when true, makes FreeWhisper set the microphone's input
+	// level to MicVolume before each recording. This is the *Windows* mic level
+	// (IAudioEndpointVolume) — system-wide, so it affects every app, not just
+	// us. Default false: we leave the system level untouched.
+	MicVolumeManage bool `json:"manage_mic_volume"`
+
+	// MicVolume is the input level (0–100%) applied when MicVolumeManage is on.
+	MicVolume int `json:"mic_volume"`
+
 	// HotkeyModifiers lists the modifier keys that must be held alongside
 	// HotkeyKey. Valid entries: "Ctrl", "Alt", "Shift", "Win" (case-
 	// insensitive on load). RegisterHotKey requires at least one modifier;
@@ -96,7 +105,9 @@ func DefaultConfig() Config {
 		WhisperHost:       "",
 		WhisperPort:       10300, // safe to default — same on every Wyoming install
 		Language:          "en",
-		MicDeviceID:       "", // follow the Windows default mic
+		MicDeviceID:       "",    // follow the Windows default mic
+		MicVolumeManage:   false, // don't touch the system mic level by default
+		MicVolume:         75,    // sensible starting level if the user enables it
 		HotkeyModifiers:   []string{"Ctrl"},
 		HotkeyKey:         "Backtick",
 		NotifyColorChange: false,
@@ -170,6 +181,13 @@ func LoadConfig() (Config, string, bool) {
 	cfg.NotifyColorChange = fromFile.NotifyColorChange
 	cfg.NotifyBeep = fromFile.NotifyBeep
 	cfg.RestoreClipboard = fromFile.RestoreClipboard
+	cfg.MicVolumeManage = fromFile.MicVolumeManage
+	// MicVolume: keep the default (75) when the field is absent/zero; any real
+	// 1–100 value overrides. Muting via this slider isn't a use case — users
+	// would just uncheck "manage" instead.
+	if fromFile.MicVolume > 0 {
+		cfg.MicVolume = fromFile.MicVolume
+	}
 
 	// SilenceDurationMs == 0 is "absent or invalid" — keep the default.
 	if fromFile.SilenceDurationMs > 0 {

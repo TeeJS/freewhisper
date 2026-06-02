@@ -3,6 +3,8 @@
   "whisper_port": 10300,
   "language": "en",
   "mic_device_id": "",
+  "manage_mic_volume": false,
+  "mic_volume": 75,
   "hotkey_modifiers": ["Ctrl"],
   "hotkey_key": "Backtick",
   "notify_color_change": false,

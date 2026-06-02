@@ -68,7 +68,8 @@ func runSettingsDialog() error {
 	var serverEdit, portEdit, languageEdit, silenceEdit, hotkeyKeyCombo *walk.LineEdit
 	var keyCombo, micCombo *walk.ComboBox
 	var modCtrl, modAlt, modShift, modWin *walk.CheckBox
-	var notifyColor, notifyBeep, restoreClipboard *walk.CheckBox
+	var notifyColor, notifyBeep, restoreClipboard, manageVolume *walk.CheckBox
+	var volSlider *walk.Slider
 	var okBtn, cancelBtn *walk.PushButton
 	_ = hotkeyKeyCombo // silence linter — placeholder if we ever swap LineEdit for ComboBox
 
@@ -105,10 +106,20 @@ func runSettingsDialog() error {
 		}
 	}
 
+	// Microphone input-level slider. When we're managing the level, seed it
+	// from config; otherwise show the device's current actual level so that
+	// turning "manage" on captures where it already sits rather than jumping.
+	volValue := current.MicVolume
+	if !current.MicVolumeManage {
+		if v, verr := readCaptureVolume(current.MicDeviceID); verr == nil {
+			volValue = v
+		}
+	}
+
 	err := (Dialog{
 		AssignTo:      &dlg,
 		Title:         "FreeWhisper Settings",
-		MinSize:       Size{Width: 380, Height: 480},
+		MinSize:       Size{Width: 380, Height: 540},
 		Layout:        VBox{},
 		DefaultButton: &okBtn,
 		CancelButton:  &cancelBtn,
@@ -136,6 +147,9 @@ func runSettingsDialog() error {
 						CurrentIndex: micIndex,
 					},
 					Label{Text: "(\"System Default\" follows your Windows default mic. Applies on your next dictation.)"},
+					CheckBox{AssignTo: &manageVolume, Text: "Set input level on each recording", Checked: current.MicVolumeManage},
+					Slider{AssignTo: &volSlider, MinValue: 0, MaxValue: 100, Value: volValue},
+					Label{Text: "(System-wide: changes the Windows mic level for every app, not just FreeWhisper.)"},
 				},
 			},
 			GroupBox{
@@ -207,6 +221,15 @@ func runSettingsDialog() error {
 							// micCombo's index lines up with micIDs ([0] = "" = system default).
 							if i := micCombo.CurrentIndex(); i >= 0 && i < len(micIDs) {
 								next.MicDeviceID = micIDs[i]
+							}
+							next.MicVolumeManage = manageVolume.Checked()
+							next.MicVolume = volSlider.Value()
+							// Apply the level right away so the change is visible
+							// in Windows immediately, not only on the next record.
+							if next.MicVolumeManage {
+								if verr := applyCaptureVolume(next.MicDeviceID, next.MicVolume); verr != nil {
+									log.Printf("settings: could not apply mic level: %v", verr)
+								}
 							}
 							var mods []string
 							if modCtrl.Checked() {
