@@ -37,6 +37,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"time"
@@ -257,6 +258,9 @@ func (r *ChunkedRecorder) captureLoop() ([]byte, error) {
 	var inSpeech bool
 	var silenceFramesSeen int
 	seq := 0
+	// calibLogged ensures we report the VAD's calibration result exactly
+	// once per recording (the frame where it flips to calibrated).
+	calibLogged := false
 
 	emit := func() {
 		if chunkBuf.Len() == 0 {
@@ -280,6 +284,20 @@ func (r *ChunkedRecorder) captureLoop() ([]byte, error) {
 		fullBuf.Write(frame)
 
 		isSpeech := vad.IsSpeech(frame)
+
+		// Report the calibration outcome once, the moment it completes.
+		// A "suspect" result means the user likely spoke during the 200 ms
+		// calibration window; the threshold fell back to the safe minimum.
+		if !calibLogged && vad.Calibrated() {
+			calibLogged = true
+			if vad.CalibrationSuspect() {
+				log.Printf("VAD calibration suspect: measured noise floor %.0f RMS exceeds ceiling %.0f (likely spoke too soon); using fallback threshold %.0f",
+					vad.NoiseFloor(), noiseFloorCeiling, vad.Threshold())
+			} else {
+				log.Printf("VAD calibrated: noise floor %.0f RMS, speech threshold %.0f",
+					vad.NoiseFloor(), vad.Threshold())
+			}
+		}
 
 		if isSpeech {
 			if !inSpeech {
