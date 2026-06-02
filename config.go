@@ -57,6 +57,16 @@ type Config struct {
 	// Default false to stay quiet.
 	NotifyBeep bool `json:"notify_beep"`
 
+	// RestoreClipboard controls whether we put the user's previous clipboard
+	// text back after pasting a transcript. Default false: we leave the
+	// transcript on the clipboard. Restoring is a nicety, but on machines
+	// with clipboard-monitoring/DLP software (or any slow clipboard handoff)
+	// the restore can race the target app's paste and cause the OLD clipboard
+	// to land instead of the transcript. Leaving the transcript on the
+	// clipboard makes the paste reliable; set true only if you specifically
+	// want your prior clipboard preserved and your machine is fast enough.
+	RestoreClipboard bool `json:"restore_clipboard"`
+
 	// SilenceDurationMs is how long the user must pause speaking before
 	// the recorder cuts the current chunk and ships it to whisper for
 	// transcription. Shorter = more responsive but more chunks (and
@@ -83,6 +93,7 @@ func DefaultConfig() Config {
 		HotkeyKey:         "Backtick",
 		NotifyColorChange: false,
 		NotifyBeep:        false,
+		RestoreClipboard:  false, // reliable default: leave transcript on clipboard
 		SilenceDurationMs: 400,
 	}
 }
@@ -145,6 +156,7 @@ func LoadConfig() (Config, string, bool) {
 	// that's the same as the safe default, so this is fine.
 	cfg.NotifyColorChange = fromFile.NotifyColorChange
 	cfg.NotifyBeep = fromFile.NotifyBeep
+	cfg.RestoreClipboard = fromFile.RestoreClipboard
 
 	// SilenceDurationMs == 0 is "absent or invalid" — keep the default.
 	if fromFile.SilenceDurationMs > 0 {
