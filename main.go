@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -40,10 +41,22 @@ var iconIdle []byte
 //go:embed icon_recording.ico
 var iconRecording []byte
 
-// appConfig holds the runtime configuration. Loaded once at startup and
-// then read-only — we treat config as immutable for the process lifetime.
-// (Hot-reload is a feature we'd add later, after there's any need for it.)
-var appConfig Config
+// appConfig holds the runtime configuration as an atomically-swappable
+// pointer. The settings dialog replaces it (via applyConfigChange) from its
+// own goroutine, while the recorder, transcriber, and indicator goroutines
+// read it concurrently. atomic.Pointer makes that hand-off safe — a reader
+// always sees either the old Config or the new one in full, never a torn
+// half-updated struct, and we don't need a mutex. Readers must go through
+// currentConfig() to take a consistent snapshot.
+var appConfig atomic.Pointer[Config]
+
+// currentConfig returns a by-value snapshot of the live configuration. Safe
+// to call from any goroutine: the swap in applyConfigChange is atomic, and
+// the returned copy is the caller's own — its fields won't change underneath
+// them even if a new config is stored a moment later.
+func currentConfig() Config {
+	return *appConfig.Load()
+}
 
 // configExisted tracks whether config.json was present at startup. The
 // settings GUI uses this to auto-open on first run (when false).
@@ -52,23 +65,24 @@ var configExisted bool
 func main() {
 	setupLogging()
 	log.Print("freewhisper starting")
-	cfgPath := ""
-	appConfig, cfgPath, configExisted = LoadConfig()
+	cfg, cfgPath, existed := LoadConfig()
+	appConfig.Store(&cfg)
+	configExisted = existed
 	if !configExisted {
 		// First run: write the defaults to disk so the user has a file
 		// to inspect/edit and to anchor the settings GUI's auto-open
 		// behavior. Failure to write is logged but non-fatal.
-		if err := appConfig.Save(); err != nil {
+		if err := cfg.Save(); err != nil {
 			log.Printf("config: first-run save failed: %v", err)
 		} else {
 			log.Printf("config: wrote default config to %s (first run)", cfgPath)
 		}
 	}
 	log.Printf("config: endpoint=%s language=%s hotkey=%s silenceMs=%d (from %s)",
-		appConfig.Endpoint(),
-		appConfig.Language,
-		HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey),
-		appConfig.SilenceDurationMs,
+		cfg.Endpoint(),
+		cfg.Language,
+		HotkeyDisplay(cfg.HotkeyModifiers, cfg.HotkeyKey),
+		cfg.SilenceDurationMs,
 		cfgPath,
 	)
 	systray.Run(onReady, onExit)
@@ -154,9 +168,10 @@ func onReady() {
 // surfaces this caveat in its layout, so we don't duplicate the warning
 // here.
 func applyConfigChange(next Config) {
-	oldHotkey := HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey)
+	old := currentConfig()
+	oldHotkey := HotkeyDisplay(old.HotkeyModifiers, old.HotkeyKey)
 	newHotkey := HotkeyDisplay(next.HotkeyModifiers, next.HotkeyKey)
-	appConfig = next
+	appConfig.Store(&next)
 	log.Printf("config updated: endpoint=%s language=%s hotkey=%s silenceMs=%d notify(color=%v beep=%v)",
 		next.Endpoint(), next.Language, newHotkey, next.SilenceDurationMs,
 		next.NotifyColorChange, next.NotifyBeep)
@@ -198,7 +213,11 @@ func registerHotkey() {
 	// trigger separate press cycles, they will be merged — acceptable trade.
 	const debounceWindow = 80 * time.Millisecond
 
-	mods, err := ParseModifiers(appConfig.HotkeyModifiers)
+	// Snapshot the config once: the chord is registered with Win32 a single
+	// time at startup and can't change without a restart, so there's nothing
+	// to gain from re-reading it here.
+	cfg := currentConfig()
+	mods, err := ParseModifiers(cfg.HotkeyModifiers)
 	if err != nil {
 		log.Printf("hotkey register: %v", err)
 		return
@@ -207,12 +226,12 @@ func registerHotkey() {
 		log.Print("hotkey register: at least one modifier (Ctrl/Alt/Shift/Win) required; check config.json")
 		return
 	}
-	key, err := ParseKey(appConfig.HotkeyKey)
+	key, err := ParseKey(cfg.HotkeyKey)
 	if err != nil {
 		log.Printf("hotkey register: %v", err)
 		return
 	}
-	display := HotkeyDisplay(appConfig.HotkeyModifiers, appConfig.HotkeyKey)
+	display := HotkeyDisplay(cfg.HotkeyModifiers, cfg.HotkeyKey)
 
 	hk := hotkey.New(mods, key)
 	if err := hk.Register(); err != nil {
@@ -228,7 +247,7 @@ func registerHotkey() {
 		<-hk.Keydown()
 		log.Print("hotkey DOWN — streaming started")
 		startRecordingIndicator()
-		rec := StartChunkedRecording(appConfig.SilenceDurationMs)
+		rec := StartChunkedRecording(currentConfig().SilenceDurationMs)
 		consumerDone := startStreamingConsumer(rec)
 
 		// Drain UP/DOWN pairs caused by auto-repeat until we see an UP
@@ -307,7 +326,11 @@ func saveCapturedWAV(pcm []byte) {
 func startStreamingConsumer(rec *ChunkedRecorder) <-chan struct{} {
 	done := make(chan struct{})
 
-	if !appConfig.EndpointConfigured() {
+	// One snapshot for the whole session — a recording is short and the
+	// endpoint/language won't meaningfully change mid-utterance.
+	cfg := currentConfig()
+
+	if !cfg.EndpointConfigured() {
 		// Drain chunks but don't try to transcribe — log once and bail.
 		go func() {
 			defer close(done)
@@ -333,7 +356,7 @@ func startStreamingConsumer(rec *ChunkedRecorder) <-chan struct{} {
 			go func() {
 				defer wg.Done()
 				start := time.Now()
-				text, err := Transcribe(appConfig.Endpoint(), appConfig.Language, chunk.PCM)
+				text, err := Transcribe(cfg.Endpoint(), cfg.Language, chunk.PCM)
 				elapsed := time.Since(start)
 				if err != nil {
 					log.Printf("chunk %d transcribe failed (%.2fs): %v", chunk.Seq, elapsed.Seconds(), err)

@@ -60,6 +60,7 @@ var (
 	procGlobalAlloc  = kernel32.NewProc("GlobalAlloc")
 	procGlobalLock   = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock = kernel32.NewProc("GlobalUnlock")
+	procGlobalFree   = kernel32.NewProc("GlobalFree")
 )
 
 // Win32 constants used below. Lowercase first letter = package-private.
@@ -69,8 +70,18 @@ const (
 	gmemMoveable   uintptr = 0x0002 // GlobalAlloc flag: clipboard requires this
 	inputKeyboard  uint32  = 1      // INPUT.type for a keyboard event
 	keyeventfKeyup uint32  = 0x0002 // KEYBDINPUT.dwFlags: release vs. press
-	vkControl      uint16  = 0x11   // Virtual-key code for Ctrl
+	vkControl      uint16  = 0x11   // Virtual-key code for Ctrl (either L/R)
 	vkV            uint16  = 0x56   // Virtual-key code for the V key
+
+	// Modifier virtual-key codes we may need to neutralize during a paste.
+	// When a non-Ctrl modifier is part of the push-to-talk chord, it's
+	// physically held while we inject Ctrl+V — see sendCtrlV for why these
+	// matter. VK_SHIFT/VK_MENU cover both the left and right physical keys;
+	// the Windows key has no combined code, so we track L and R separately.
+	vkShift uint16 = 0x10 // VK_SHIFT (either L/R)
+	vkMenu  uint16 = 0x12 // VK_MENU = Alt (either L/R)
+	vkLWin  uint16 = 0x5B // VK_LWIN (left Windows key)
+	vkRWin  uint16 = 0x5C // VK_RWIN (right Windows key)
 )
 
 // keyboardInput mirrors the Win32 INPUT struct (with the keyboard variant
@@ -216,8 +227,11 @@ func writeClipboardText(text string) error {
 	// need to free it ourselves — keep that branch honest.
 	r, _, _ = procSetClipboardData.Call(cfUnicodeText, hMem)
 	if r == 0 {
-		// Failure: we still own the memory, so release it before bailing.
-		// (LocalFree, GlobalFree, both work — GlobalFree is the textbook pair.)
+		// Failure: ownership did NOT transfer to the clipboard, so the
+		// HGLOBAL is still ours and would leak if we just returned. Free it.
+		// GlobalFree returns NULL on success; we're bailing regardless, so
+		// this is best-effort and we don't inspect the result.
+		procGlobalFree.Call(hMem)
 		return errors.New("SetClipboardData failed")
 	}
 	return nil
@@ -257,23 +271,41 @@ func closeClipboard() {
 	procCloseClipboard.Call()
 }
 
-// sendCtrlV synthesizes whatever subset of (Ctrl-down, V-down, V-up,
-// Ctrl-up) is needed for the focused window to receive a paste, based
-// on whether Ctrl is currently held by the user.
+// sendCtrlV synthesizes a Ctrl+V paste into the focused window, taking
+// care that the keystrokes the target actually receives are *exactly*
+// Ctrl+V — no more, no less — even when the user is mid-dictation with a
+// push-to-talk chord physically held down.
 //
-// Why the conditional: in streaming mode, this gets called WHILE the
-// user is holding the push-to-talk chord (e.g., Ctrl+`). If we naively
-// inject Ctrl-down…Ctrl-up, the Ctrl-up tells Windows the user has
-// released Ctrl, which un-registers the global hotkey state momentarily.
-// During that gap, every WM_KEYDOWN for `` falls through to the focused
-// window as a literal backtick character — corrupting the user's
-// dictation output with strings of backticks.
+// The problem this solves:
 //
-// Fix: check the *actual* hardware state via GetAsyncKeyState. If Ctrl
-// is already pressed, inject only V-down/V-up — the user's hand-held
-// Ctrl provides the modifier, and we never disturb the hotkey
-// registration. If Ctrl is NOT held (e.g., a deferred paste after the
-// user released the hotkey), inject the full four-event sequence.
+// In streaming mode this runs WHILE the user holds the hotkey chord (a
+// chunk pastes the moment they pause, before they release the key). Any
+// modifier in that chord — Ctrl, Alt, Shift, Win — is physically down at
+// that instant. If we just blast Ctrl-down…V…Ctrl-up, the held chord
+// modifiers ride along: a held Alt turns our paste into Ctrl+Alt+V, a
+// held Shift into Ctrl+Shift+V (paste-special in many apps), and so on.
+// Only the default Ctrl+` chord happened to work, because its sole
+// modifier (Ctrl) is the one Ctrl+V wants anyway.
+//
+// The fix — neutralize, paste, restore, all in ONE SendInput batch:
+//
+//  1. Read the live hardware state of Shift/Alt/Win via GetAsyncKeyState.
+//  2. Inject key-UP for any of them that's held, so they don't taint the V.
+//  3. Make sure Ctrl is down: reuse the user's held Ctrl if present
+//     (cheaper, and it never disturbs the hotkey), otherwise inject it.
+//  4. V-down, V-up — the actual paste.
+//  5. Release Ctrl only if WE pressed it in step 3.
+//  6. Re-press (key-down) every modifier we lifted in step 2, so the
+//     chord is left exactly as the user is still physically holding it.
+//
+// Why one batch matters: SendInput delivers its whole array without other
+// keyboard input interleaving, so the modifiers are "lifted" only for the
+// sub-millisecond span of the call. That closes the window the original
+// single-modifier version worried about (a backtick auto-repeat leaking
+// through to the focused window while a chord modifier is momentarily up).
+// Windows posts WM_HOTKEY on key-down of the chord's MAIN key (not on
+// modifier transitions while that key is held), so re-pressing a modifier
+// here doesn't spawn a spurious hotkey event.
 //
 // SendInput's signature:
 //
@@ -282,26 +314,57 @@ func closeClipboard() {
 // cbSize is the per-event size; we pass sizeof(keyboardInput) which must
 // equal sizeof(INPUT) on x64 (40 bytes).
 func sendCtrlV() error {
-	if isCtrlDown() {
-		return sendInputs([]keyboardInput{
-			{Type: inputKeyboard, Vk: vkV},
-			{Type: inputKeyboard, Vk: vkV, Flags: keyeventfKeyup},
-		})
+	// The modifiers that would corrupt a clean Ctrl+V if they rode along.
+	// Order is stable; we restore in reverse at the end.
+	neutralize := []uint16{vkShift, vkMenu, vkLWin, vkRWin}
+
+	// Snapshot which of them the user is physically holding right now.
+	held := make([]bool, len(neutralize))
+	for i, vk := range neutralize {
+		held[i] = isKeyDown(vk)
 	}
-	return sendInputs([]keyboardInput{
-		{Type: inputKeyboard, Vk: vkControl},
-		{Type: inputKeyboard, Vk: vkV},
-		{Type: inputKeyboard, Vk: vkV, Flags: keyeventfKeyup},
-		{Type: inputKeyboard, Vk: vkControl, Flags: keyeventfKeyup},
-	})
+	ctrlHeld := isKeyDown(vkControl)
+
+	// Build the single atomic sequence described in the doc comment.
+	seq := make([]keyboardInput, 0, 8)
+
+	// (2) Lift held chord modifiers so the V lands clean.
+	for i, vk := range neutralize {
+		if held[i] {
+			seq = append(seq, keyboardInput{Type: inputKeyboard, Vk: vk, Flags: keyeventfKeyup})
+		}
+	}
+	// (3) Ensure Ctrl is down — borrow the user's if they're already on it.
+	if !ctrlHeld {
+		seq = append(seq, keyboardInput{Type: inputKeyboard, Vk: vkControl})
+	}
+	// (4) The paste itself.
+	seq = append(seq,
+		keyboardInput{Type: inputKeyboard, Vk: vkV},
+		keyboardInput{Type: inputKeyboard, Vk: vkV, Flags: keyeventfKeyup},
+	)
+	// (5) Release Ctrl only if we were the ones who pressed it.
+	if !ctrlHeld {
+		seq = append(seq, keyboardInput{Type: inputKeyboard, Vk: vkControl, Flags: keyeventfKeyup})
+	}
+	// (6) Re-press the modifiers we lifted, reverse order, so we hand the
+	// keyboard back exactly as the user is still holding it.
+	for i := len(neutralize) - 1; i >= 0; i-- {
+		if held[i] {
+			seq = append(seq, keyboardInput{Type: inputKeyboard, Vk: neutralize[i]})
+		}
+	}
+
+	return sendInputs(seq)
 }
 
-// isCtrlDown reports whether either physical Ctrl key is currently
-// pressed, according to Win32's GetAsyncKeyState. The high-order bit of
-// the SHORT return is set when the key is down, so we test against
-// 0x8000. We check VK_CONTROL which covers both left and right Ctrl.
-func isCtrlDown() bool {
-	r, _, _ := procGetAsyncKeyState.Call(uintptr(vkControl))
+// isKeyDown reports whether the given virtual key is currently pressed,
+// according to Win32's GetAsyncKeyState. The high-order bit of the SHORT
+// return is set when the key is down, so we test against 0x8000. Passing
+// a "both sides" code like VK_CONTROL/VK_SHIFT/VK_MENU reports either the
+// left or right physical key being held.
+func isKeyDown(vk uint16) bool {
+	r, _, _ := procGetAsyncKeyState.Call(uintptr(vk))
 	return uint16(r)&0x8000 != 0
 }
 

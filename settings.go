@@ -73,7 +73,7 @@ func runSettingsDialog() error {
 	_ = hotkeyKeyCombo // silence linter — placeholder if we ever swap LineEdit for ComboBox
 
 	// Snapshot the current config so the form starts populated correctly.
-	current := appConfig
+	current := currentConfig()
 	hasMod := map[string]bool{}
 	for _, m := range current.HotkeyModifiers {
 		hasMod[m] = true
