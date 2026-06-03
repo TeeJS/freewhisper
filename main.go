@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -358,127 +357,78 @@ func startStreamingConsumer(rec *ChunkedRecorder) <-chan struct{} {
 
 	go func() {
 		defer close(done)
-		paster := newOrderedPaster()
-		var wg sync.WaitGroup
-
+		// Serial, in-order transcription. The recorder delivers chunks on its
+		// channel already in seq order; we transcribe and paste each one before
+		// moving to the next. This is deliberate:
+		//   - ONE Wyoming connection at a time. faster-whisper serves a single
+		//     session per connection; firing many parallel connections (the old
+		//     design) made the server cross/drop/time-out responses, which
+		//     produced dropped, duplicated, and reordered text in real use.
+		//   - In seq order by construction, so there is nothing to reassemble.
+		// Words still appear at each pause as you talk — just reliably now.
+		pasted := 0
 		for chunk := range rec.Chunks() {
-			chunk := chunk // capture for goroutine
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				start := time.Now()
-				text, err := Transcribe(cfg.Endpoint(), cfg.Language, chunk.PCM)
-				elapsed := time.Since(start)
-				if err != nil {
-					log.Printf("chunk %d transcribe failed (%.2fs): %v", chunk.Seq, elapsed.Seconds(), err)
-				} else {
-					log.Printf("chunk %d transcript (%.2fs, %d bytes audio): %q",
-						chunk.Seq, elapsed.Seconds(), len(chunk.PCM), text)
-				}
-				paster.Submit(chunk.Seq, text, err)
-			}()
+			start := time.Now()
+			text, err := Transcribe(cfg.Endpoint(), cfg.Language, chunk.PCM)
+			elapsed := time.Since(start)
+			if err != nil {
+				log.Printf("chunk %d transcribe failed (%.2fs): %v", chunk.Seq, elapsed.Seconds(), err)
+				continue
+			}
+			text = strings.TrimSpace(text)
+			log.Printf("chunk %d transcript (%.2fs, %d bytes audio): %q",
+				chunk.Seq, elapsed.Seconds(), len(chunk.PCM), text)
+			if text == "" {
+				continue
+			}
+			if isLikelyHallucination(text) {
+				log.Printf("chunk %d skipped (likely silence hallucination): %q", chunk.Seq, text)
+				continue
+			}
+			// Chunks after the first get a leading space so they read as a
+			// flowing sentence rather than glued-together words.
+			if pasted > 0 {
+				text = " " + text
+			}
+			if err := Paste(text); err != nil {
+				log.Printf("chunk %d paste failed: %v", chunk.Seq, err)
+				continue
+			}
+			pasted++
 		}
-		// All chunks received from the recorder — wait for outstanding
-		// transcribes to deposit results, then close the paster so it
-		// flushes whatever's left in order.
-		wg.Wait()
-		paster.Close()
 	}()
 
 	return done
 }
 
-// orderedPaster receives transcription results out-of-order and pastes
-// them into the focused window in seq order. It owns a single goroutine
-// (started by newOrderedPaster), serializes pastes through a channel,
-// and exits cleanly when Close() is called and all submitted work has
-// been processed.
-type orderedPaster struct {
-	incoming chan pasteResult
-	done     chan struct{}
-}
-
-type pasteResult struct {
-	seq  int
-	text string
-	err  error
-}
-
-func newOrderedPaster() *orderedPaster {
-	p := &orderedPaster{
-		incoming: make(chan pasteResult, 32),
-		done:     make(chan struct{}),
+// isLikelyHallucination reports whether a chunk transcript is one of Whisper's
+// well-known "silence hallucinations" — phrases the model emits when handed
+// near-silent or noise-only audio (it learned them from training data full of
+// YouTube captions: "Thanks for watching!", "Thank you.", etc.). When a whole
+// VAD chunk transcribes to ONLY one of these, it's almost certainly noise, not
+// something the user said, so we drop it instead of pasting garbage.
+//
+// Matching is on the entire trimmed transcript (lowercased, surrounding
+// punctuation stripped) — so a real sentence that merely contains "thank you"
+// is unaffected; only a chunk that is *nothing but* the phrase is dropped.
+// It's a denylist: add to it freely if new hallucinations show up in the log.
+func isLikelyHallucination(text string) bool {
+	n := strings.ToLower(strings.TrimSpace(text))
+	n = strings.Trim(n, " .,!?-…\"'")
+	switch n {
+	case "",
+		"you",
+		"thank you",
+		"thanks",
+		"thanks for watching",
+		"thank you for watching",
+		"thank you very much",
+		"bye",
+		"bye bye",
+		"pfft",
+		"subscribe",
+		"please subscribe":
+		return true
 	}
-	go p.run()
-	return p
-}
-
-// Submit hands a transcription result to the paster. Safe to call from
-// any goroutine. Non-blocking unless the incoming buffer (32 deep) is
-// completely full, which would require 32+ chunks pending paste — very
-// unlikely in practice.
-func (p *orderedPaster) Submit(seq int, text string, err error) {
-	p.incoming <- pasteResult{seq: seq, text: text, err: err}
-}
-
-// Close signals no more submissions are coming and blocks until the
-// paster has drained its queue and pasted everything that can be pasted.
-// Out-of-order tail items (e.g. seq 5 arrived but seq 4 never did) are
-// dropped on close — better than waiting forever for a transcribe that
-// errored mid-flight.
-func (p *orderedPaster) Close() {
-	close(p.incoming)
-	<-p.done
-}
-
-func (p *orderedPaster) run() {
-	defer close(p.done)
-
-	pending := map[int]pasteResult{}
-	nextSeq := 0
-
-	flush := func() {
-		// Paste anything that's now in order.
-		for {
-			r, ok := pending[nextSeq]
-			if !ok {
-				return
-			}
-			delete(pending, nextSeq)
-			p.pasteOne(r, nextSeq)
-			nextSeq++
-		}
-	}
-
-	for r := range p.incoming {
-		pending[r.seq] = r
-		flush()
-	}
-
-	// Channel closed. Anything still in pending is out-of-order tail —
-	// either a transcribe errored before reporting (and we never got
-	// that seq) or sequencing got confused. Either way, drop these
-	// silently; the alternative (blocking forever) is worse.
-}
-
-// pasteOne handles the per-chunk paste logic: trim whitespace, add a
-// leading space if this isn't the first chunk in the session (so words
-// flow together), call Paste(). Errors are logged but don't stop the
-// queue.
-func (p *orderedPaster) pasteOne(r pasteResult, seq int) {
-	if r.err != nil {
-		return // already logged at transcribe site
-	}
-	text := strings.TrimSpace(r.text)
-	if text == "" {
-		return
-	}
-	// Chunks after the first get a leading space so consecutive chunks
-	// read as a sentence rather than glued-together words.
-	if seq > 0 {
-		text = " " + text
-	}
-	if err := Paste(text); err != nil {
-		log.Printf("paste seq %d failed: %v", seq, err)
-	}
+	return false
 }
